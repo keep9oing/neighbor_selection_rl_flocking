@@ -55,6 +55,7 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             #                                  i's own flock-center-frame state.
             self.aux_enabled = cfg["aux_enabled"] if "aux_enabled" in cfg else False
             self.aux_loss_coef = cfg["aux_loss_coef"] if "aux_loss_coef" in cfg else 0.1
+            self.aux_loss_coef_critic = cfg["aux_loss_coef_critic"] if "aux_loss_coef_critic" in cfg else 0.0
             self.aux_target_dim = cfg["aux_target_dim"] if "aux_target_dim" in cfg else 4
             self.aux_type = cfg["aux_type"] if "aux_type" in cfg else "pair_embedding"
             assert self.aux_type in ("pair_embedding", "context"), \
@@ -192,12 +193,22 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
                 nn.ReLU(),
                 nn.Linear(in_features=aux_in, out_features=self.aux_target_dim),
             )
+            # Critic gets its own aux_branch when share_layers=False (separate encoder).
+            # When share_layers=True the shared encoder already gets aux gradient from actor side.
+            if not share_layers and self.aux_loss_coef_critic > 0:
+                self.aux_branch_critic = nn.Sequential(
+                    nn.Linear(in_features=aux_in, out_features=aux_in),
+                    nn.ReLU(),
+                    nn.Linear(in_features=aux_in, out_features=self.aux_target_dim),
+                )
         # Caches (set in forward(), read in custom_loss()):
         self._aux_features = None         # (B, N, d_ctx) for context  OR  (B, N, N, d_embed) for pair
+        self._aux_features_critic = None  # same shape as above, from critic encoder
         self._aux_target = None           # (B, N, aux_target_dim) — same global descriptor for both modes
         self._aux_padding_mask = None     # (B, N), float
         self._aux_neighbor_masks = None   # (B, N, N), float
-        self._last_aux_loss = None        # scalar tensor for metrics()
+        self._last_aux_loss = None        # scalar for actor aux
+        self._last_aux_loss_critic = None # scalar for critic aux
 
     def forward(
         self,
@@ -218,7 +229,8 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
         if self.share_layers:
             self.values = h_c_N.squeeze(1)                      # (batch_size, d_embed_context)
         else:
-            self.values = self.critic(obs_dict)[1].squeeze(1)   # (batch_size, d_embed_context)
+            critic_out = self.critic(obs_dict)
+            self.values = critic_out[1].squeeze(1)              # (batch_size, d_embed_context)
 
         if self.aux_enabled:
             # Cache live (gradient-bearing) features for the active aux head. Same lifecycle as
@@ -231,6 +243,12 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             self._aux_target = obs_dict["global_agent_infos"].float()   # (B, N_max, aux_target_dim)
             self._aux_padding_mask = obs_dict["padding_mask"].float()   # (B, N_max)
             self._aux_neighbor_masks = obs_dict["neighbor_masks"].float()  # (B, N_max, N_max)
+            # Critic encoder features for critic aux (only when separate encoders)
+            if not self.share_layers and self.aux_loss_coef_critic > 0:
+                if self.aux_type == "pair_embedding":
+                    self._aux_features_critic = critic_out[3]     # (B, N_i, N_j, d_embed_input)
+                else:
+                    self._aux_features_critic = critic_out[2]     # (B, N_max, d_embed_context)
 
         return x, state
 
@@ -276,56 +294,61 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
         value = self.value_branch(self.values).squeeze(-1)  # (batch_size,)
         return value
 
+    def _compute_aux_mse(self, branch, feats, target, pad, nm):
+        """Shared MSE computation for a given aux branch and features."""
+        T = self.aux_target_dim
+        if self.aux_type == "pair_embedding":
+            pred = branch(feats)                                      # (B, N_i, N_j, T)
+            target_b = target.unsqueeze(1).expand_as(pred)            # (B, N_i, N_j, T)
+            mask = (pad.unsqueeze(2) * pad.unsqueeze(1) * nm).unsqueeze(-1)
+        else:  # "context"
+            pred = branch(feats)                                      # (B, N, T)
+            target_b = target                                         # (B, N, T)
+            diag_nm = nm.diagonal(dim1=-2, dim2=-1)                   # (B, N)
+            mask = (pad * diag_nm).unsqueeze(-1)                      # (B, N, 1)
+        denom = (mask.sum() * T).clamp(min=1.0)
+        return ((pred - target_b) ** 2 * mask).sum() / denom
+
     def custom_loss(self, policy_loss, loss_inputs):
         """
-        Auxiliary self-supervised regression. Two modes (config: aux_type):
+        Auxiliary self-supervised regression on actor (and optionally critic) encoder.
 
-        - "pair_embedding" (default): for each agent pair (i, j), the encoder embedding of j
-              as seen by i predicts agent j's flock-center-frame state. Same target for any i
-              that observes j. Mask: pad[i] * pad[j] * neighbor_masks[i, j].
+        Actor aux: encoder per-pair embedding (or context vector) predicts flock-center state.
+        Critic aux (share_layers=False only): same task on the critic's separate encoder.
 
-        - "context": each agent i's pooled context vector h_c_N[i] predicts i's own
-              flock-center-frame state. Mask: pad[i] * neighbor_masks[i, i] (self-loop).
-
-        RLlib v2.1.0 contract: policy_loss arrives as a list (PPO: length 1) from
-        TorchPolicyV2._multi_gpu_parallel_grad_calc; return a list of the same length.
+        RLlib v2.1.0 contract: policy_loss arrives as a list (PPO: length 1);
+        return a list of the same length.
         """
         if not self.aux_enabled:
             return policy_loss
 
-        target = self._aux_target          # (B, N, T)
-        pad = self._aux_padding_mask       # (B, N), float in {0,1}
-        nm = self._aux_neighbor_masks      # (B, N, N), float in {0,1}
-        T = self.aux_target_dim
+        target = self._aux_target
+        pad = self._aux_padding_mask
+        nm = self._aux_neighbor_masks
 
-        if self.aux_type == "pair_embedding":
-            feats = self._aux_features                                # (B, N_i, N_j, d_embed_input)
-            pred = self.aux_branch(feats)                             # (B, N_i, N_j, T)
-            # Agent j's state is the same regardless of who observes it — broadcast across i.
-            target_b = target.unsqueeze(1).expand_as(pred)            # (B, N_i, N_j, T)
-            # Mask: i real AND j real AND i can see j (handles non-FC; in FC, nm is all-ones for
-            # non-padded but ones-everywhere for padded too — so pad multiplication is essential).
-            mask = (pad.unsqueeze(2) * pad.unsqueeze(1) * nm).unsqueeze(-1)  # (B, N_i, N_j, 1)
-        else:  # "context"
-            feats = self._aux_features                                # (B, N, d_ctx)
-            pred = self.aux_branch(feats)                             # (B, N, T)
-            target_b = target                                         # (B, N, T) — i predicts row i
-            # Per-agent mask: real AND has a self-loop (i.e., is in its own local view).
-            # neighbor_masks[..., diag] equals pad for non-FC and equals 1 for FC.
-            diag_nm = nm.diagonal(dim1=-2, dim2=-1)                   # (B, N)
-            mask = (pad * diag_nm).unsqueeze(-1)                      # (B, N, 1)
+        # Actor aux
+        aux_actor = self._compute_aux_mse(self.aux_branch, self._aux_features, target, pad, nm)
+        total_aux = self.aux_loss_coef * aux_actor
+        self._last_aux_loss = aux_actor.detach()
 
-        denom = (mask.sum() * T).clamp(min=1.0)
-        aux = ((pred - target_b) ** 2 * mask).sum() / denom
+        # Critic aux (only when separate encoder exists and coef > 0)
+        self._last_aux_loss_critic = None
+        if (not self.share_layers and self.aux_loss_coef_critic > 0
+                and self._aux_features_critic is not None):
+            aux_critic = self._compute_aux_mse(
+                self.aux_branch_critic, self._aux_features_critic, target, pad, nm)
+            total_aux = total_aux + self.aux_loss_coef_critic * aux_critic
+            self._last_aux_loss_critic = aux_critic.detach()
 
-        self._last_aux_loss = aux.detach()
-        return [pl + self.aux_loss_coef * aux for pl in policy_loss]
+        return [pl + total_aux for pl in policy_loss]
 
     def metrics(self):
-        """Surface aux MSE in RLlib's learner info dict."""
         if not self.aux_enabled or self._last_aux_loss is None:
             return {}
-        return {"aux_mse": float(self._last_aux_loss)}
+        d = {"aux_mse": float(self._last_aux_loss)}
+        if self._last_aux_loss_critic is not None:
+            d["aux_mse_critic"] = float(self._last_aux_loss_critic)
+        return d
 
 
 class NeighborSelectorTorch(nn.Module):
