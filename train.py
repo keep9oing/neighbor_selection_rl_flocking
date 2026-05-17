@@ -46,6 +46,7 @@ if __name__ == "__main__":
     my_config.env.seed = None
     my_config.env.task_type = "acs"
     my_config.env.use_fixed_episode_length = True
+    my_config.env.expose_aux_target = True  # emit flock-center-frame 'global_agent_infos' for the aux head
 
     # control config:
     my_config.control.beta = 1/3
@@ -86,6 +87,11 @@ if __name__ == "__main__":
         "share_layers": False,
         "use_FNN_in_decoder": True,
         "use_residual_in_decoder": True,
+        # Auxiliary task: pair_embedding type, sweep aux_loss_coef.
+        "aux_enabled": True,
+        "aux_type": "pair_embedding",
+        "aux_loss_coef": tune.grid_search([0.1, 0.3, 0.8, 1.6]),
+        "aux_target_dim": 4,
     }
 
     # register your custom model
@@ -95,7 +101,7 @@ if __name__ == "__main__":
     # train
     tune.run(
         "PPO",
-        name="neighbor_selection_test_260205",
+        name="aux_weight_sweep_260515",
         local_dir="/workspace/test_results",
         # resume=True,
         checkpoint_freq=8,
@@ -110,9 +116,9 @@ if __name__ == "__main__":
                 "custom_model": model_name,
                 "custom_model_config": custom_model_config,
             },
-            "num_gpus": 0.5,
-            "num_workers": 16,
-            "num_envs_per_worker": 1,
+            "num_gpus": 0.25,
+            "num_workers": 8,
+            "num_envs_per_worker": 2,
             "rollout_fragment_length": 1024,
             "train_batch_size": 16384,
             "sgd_minibatch_size": 256,

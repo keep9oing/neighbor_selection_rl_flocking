@@ -51,3 +51,6 @@ htmlcov/
 .cache/
 
 ray_results/
+
+# Claude Code
+CLAUDE.md

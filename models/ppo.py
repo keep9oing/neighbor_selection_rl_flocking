@@ -47,6 +47,18 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             use_residual_in_decoder = cfg["use_residual_in_decoder"] if "use_residual_in_decoder" in cfg else True
             use_FNN_in_decoder = cfg["use_FNN_in_decoder"] if "use_FNN_in_decoder" in cfg else True
             self.scale_factor = cfg["scale_factor"] if "scale_factor" in cfg else 1.0
+            # Auxiliary task hyperparameters
+            #   aux_type:
+            #     "pair_embedding" (default) — for each pair (i, j), use encoder embedding of j as seen
+            #                                  by i to predict j's flock-center-frame state.
+            #     "context"                  — use agent i's pooled context vector h_c_N[i] to predict
+            #                                  i's own flock-center-frame state.
+            self.aux_enabled = cfg["aux_enabled"] if "aux_enabled" in cfg else False
+            self.aux_loss_coef = cfg["aux_loss_coef"] if "aux_loss_coef" in cfg else 0.1
+            self.aux_target_dim = cfg["aux_target_dim"] if "aux_target_dim" in cfg else 4
+            self.aux_type = cfg["aux_type"] if "aux_type" in cfg else "pair_embedding"
+            assert self.aux_type in ("pair_embedding", "context"), \
+                f"aux_type must be 'pair_embedding' or 'context'; got {self.aux_type!r}"
 
             if use_residual_in_decoder != use_FNN_in_decoder:
                 warning_text = "Warning: use_residual_in_decoder != use_FNN_in_decoder; may cause unexpected behavior"
@@ -163,6 +175,30 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             nn.Linear(in_features=d_embed_context, out_features=1),  # state-value function
         )
 
+        # 4. Define auxiliary branch
+        #    - pair_embedding: aux_branch acts per (i, j) pair on the encoder embedding (d_embed_input).
+        #                      Output dim is d_aux_target_dim; predicts j's flock-center state.
+        #    - context: aux_branch acts per agent i on the pooled context vector (d_embed_context).
+        #               Output dim is d_aux_target_dim; predicts i's own flock-center state.
+        #    Both heads mirror the value_branch pattern (1 hidden, ReLU, input_dim == hidden_dim).
+        self._num_agents_max = action_space.shape[0]
+        if self.aux_enabled:
+            if self.aux_type == "pair_embedding":
+                aux_in = d_embed_input
+            else:  # "context"
+                aux_in = d_embed_context
+            self.aux_branch = nn.Sequential(
+                nn.Linear(in_features=aux_in, out_features=aux_in),
+                nn.ReLU(),
+                nn.Linear(in_features=aux_in, out_features=self.aux_target_dim),
+            )
+        # Caches (set in forward(), read in custom_loss()):
+        self._aux_features = None         # (B, N, d_ctx) for context  OR  (B, N, N, d_embed) for pair
+        self._aux_target = None           # (B, N, aux_target_dim) — same global descriptor for both modes
+        self._aux_padding_mask = None     # (B, N), float
+        self._aux_neighbor_masks = None   # (B, N, N), float
+        self._last_aux_loss = None        # scalar tensor for metrics()
+
     def forward(
         self,
         input_dict: Dict[str, TensorType],
@@ -172,9 +208,11 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
 
         obs_dict = input_dict["obs"]
 
-        # att: (batch_size, num_agents_max, num_agents_max)
-        # h_c_N: (batch_size, 1, d_embed_context)
-        att, h_c_N = self.actor(obs_dict)
+        # att:                  (batch_size, num_agents_max, num_agents_max)
+        # h_c_N:                (batch_size, 1, d_embed_context) - swarm-averaged context (for value branch)
+        # per_agent_h_c_N:      (batch_size, num_agents_max, d_embed_context) - for context aux branch
+        # per_pair_encoder_out: (batch_size, N_i, N_j, d_embed_input) - for pair_embedding aux branch
+        att, h_c_N, per_agent_h_c_N, per_pair_encoder_out = self.actor(obs_dict)
         x = self.attention_scores_to_logits(att)  # (batch_size, num_agents_max * num_agents_max * 2)
 
         if self.share_layers:
@@ -182,10 +220,17 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
         else:
             self.values = self.critic(obs_dict)[1].squeeze(1)   # (batch_size, d_embed_context)
 
-        # batch_size = h_c_N.shape[0]
-        # if batch_size != 32 and batch_size !=1:
-        #     print(f"batch_size = {batch_size}")
-        #     print("stopped for debugging purposes")
+        if self.aux_enabled:
+            # Cache live (gradient-bearing) features for the active aux head. Same lifecycle as
+            # self.values: PPO's loss() just ran forward() on the train minibatch, so these tensors
+            # are the in-flight train batch with proper grad.
+            if self.aux_type == "pair_embedding":
+                self._aux_features = per_pair_encoder_out         # (B, N_i, N_j, d_embed_input)
+            else:  # "context"
+                self._aux_features = per_agent_h_c_N              # (B, N_max, d_embed_context)
+            self._aux_target = obs_dict["global_agent_infos"].float()   # (B, N_max, aux_target_dim)
+            self._aux_padding_mask = obs_dict["padding_mask"].float()   # (B, N_max)
+            self._aux_neighbor_masks = obs_dict["neighbor_masks"].float()  # (B, N_max, N_max)
 
         return x, state
 
@@ -230,6 +275,57 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
         # assert self.values.dim() == 2, "self.values.dim() != 2; NOT 2D"
         value = self.value_branch(self.values).squeeze(-1)  # (batch_size,)
         return value
+
+    def custom_loss(self, policy_loss, loss_inputs):
+        """
+        Auxiliary self-supervised regression. Two modes (config: aux_type):
+
+        - "pair_embedding" (default): for each agent pair (i, j), the encoder embedding of j
+              as seen by i predicts agent j's flock-center-frame state. Same target for any i
+              that observes j. Mask: pad[i] * pad[j] * neighbor_masks[i, j].
+
+        - "context": each agent i's pooled context vector h_c_N[i] predicts i's own
+              flock-center-frame state. Mask: pad[i] * neighbor_masks[i, i] (self-loop).
+
+        RLlib v2.1.0 contract: policy_loss arrives as a list (PPO: length 1) from
+        TorchPolicyV2._multi_gpu_parallel_grad_calc; return a list of the same length.
+        """
+        if not self.aux_enabled:
+            return policy_loss
+
+        target = self._aux_target          # (B, N, T)
+        pad = self._aux_padding_mask       # (B, N), float in {0,1}
+        nm = self._aux_neighbor_masks      # (B, N, N), float in {0,1}
+        T = self.aux_target_dim
+
+        if self.aux_type == "pair_embedding":
+            feats = self._aux_features                                # (B, N_i, N_j, d_embed_input)
+            pred = self.aux_branch(feats)                             # (B, N_i, N_j, T)
+            # Agent j's state is the same regardless of who observes it — broadcast across i.
+            target_b = target.unsqueeze(1).expand_as(pred)            # (B, N_i, N_j, T)
+            # Mask: i real AND j real AND i can see j (handles non-FC; in FC, nm is all-ones for
+            # non-padded but ones-everywhere for padded too — so pad multiplication is essential).
+            mask = (pad.unsqueeze(2) * pad.unsqueeze(1) * nm).unsqueeze(-1)  # (B, N_i, N_j, 1)
+        else:  # "context"
+            feats = self._aux_features                                # (B, N, d_ctx)
+            pred = self.aux_branch(feats)                             # (B, N, T)
+            target_b = target                                         # (B, N, T) — i predicts row i
+            # Per-agent mask: real AND has a self-loop (i.e., is in its own local view).
+            # neighbor_masks[..., diag] equals pad for non-FC and equals 1 for FC.
+            diag_nm = nm.diagonal(dim1=-2, dim2=-1)                   # (B, N)
+            mask = (pad * diag_nm).unsqueeze(-1)                      # (B, N, 1)
+
+        denom = (mask.sum() * T).clamp(min=1.0)
+        aux = ((pred - target_b) ** 2 * mask).sum() / denom
+
+        self._last_aux_loss = aux.detach()
+        return [pl + self.aux_loss_coef * aux for pl in policy_loss]
+
+    def metrics(self):
+        """Surface aux MSE in RLlib's learner info dict."""
+        if not self.aux_enabled or self._last_aux_loss is None:
+            return {}
+        return {"aux_mse": float(self._last_aux_loss)}
 
 
 class NeighborSelectorTorch(nn.Module):
@@ -315,15 +411,16 @@ class NeighborSelectorTorch(nn.Module):
         #
         #    So now we pass the flattened arguments:
         # ------------------------------------------------------------
-        sub_att_scores_flat, _, h_c_N_flat = self.local_forward(
+        sub_att_scores_flat, _, h_c_N_flat, encoder_out_flat = self.local_forward(
             flat_agent_infos,  # (batch_size * num_agents_max, num_agents_max, obs_dim)
             flat_network,  # (batch_size * num_agents_max, num_agents_max)
             flat_padding_mask_for_neighbors,  # (batch_size * num_agents_max, num_agents_max)
             flat_is_from_my_env,  # (batch_size * num_agents_max,)
             flat_local_padding_flags  # (batch_size * num_agents_max,)
         )
-        # sub_att_scores_flat => (batch_size * num_agents_max, num_agents_max)
-        # h_c_N_flat         => (batch_size * num_agents_max, 1, d_embed_context)
+        # sub_att_scores_flat  => (batch_size * num_agents_max, num_agents_max)
+        # h_c_N_flat           => (batch_size * num_agents_max, 1, d_embed_context)
+        # encoder_out_flat     => (batch_size * num_agents_max, num_agents_max, d_embed_input)
 
         # ------------------------------------------------------------
         # 4) Reshape back to the original (batch_size, num_agents_max, num_agents_max)
@@ -348,12 +445,24 @@ class NeighborSelectorTorch(nn.Module):
         num_agents_per_sample = num_agents_per_sample.view(-1, 1, 1).float()  # (batch_size, 1, 1)
         average_h_c_N = h_c_N_accumulator / num_agents_per_sample  # (batch_size, 1, d_embed_context)
 
+        # Per-agent context vectors (for auxiliary heads). Padded rows are exactly zero
+        # (set in local_forward), so downstream consumers can mask via padding_mask.
+        per_agent_h_c_N = h_c_N_reshaped.squeeze(2).permute(1, 0, 2)  # (batch_size, num_agents_max, d_embed_context)
+
+        # Per-pair encoder embeddings (for the pair_embedding aux head). The flatten/permute
+        # order in step 2 was permute(1,0,...).reshape -> (i*b, j, d_embed). Inverse: view -> permute.
+        d_embed_input = encoder_out_flat.shape[-1]
+        encoder_out_reshaped = encoder_out_flat.view(num_agents_max, batch_size, num_agents_max, d_embed_input)
+        per_pair_encoder_out = encoder_out_reshaped.permute(1, 0, 2, 3)  # (batch_size, N_i, N_j, d_embed_input)
+
         # ------------------------------------------------------------
         # 6) Return results
         # ------------------------------------------------------------
-        # att_scores: (batch_size, num_agents_max, num_agents_max)
-        # average_h_c_N: (batch_size, 1, d_embed_context)
-        return att_scores, average_h_c_N
+        # att_scores:           (batch_size, num_agents_max, num_agents_max)
+        # average_h_c_N:        (batch_size, 1, d_embed_context)
+        # per_agent_h_c_N:      (batch_size, num_agents_max, d_embed_context)
+        # per_pair_encoder_out: (batch_size, N_i, N_j, d_embed_input)
+        return att_scores, average_h_c_N, per_agent_h_c_N, per_pair_encoder_out
 
     def encode(self, src, src_mask):
         return self.encoder(self.src_embed(src), src_mask)
@@ -383,6 +492,9 @@ class NeighborSelectorTorch(nn.Module):
         decoder_out = torch.zeros(batch_size, 1, self.d_embed_context, device=local_agent_info.device)
         h_c_N = torch.zeros(batch_size, 1, self.d_embed_context, device=local_agent_info.device)
         sub_att_scores = torch.full((batch_size, num_agents_max), -1e9, device=local_agent_info.device)
+        # Per-query encoder output, zero-filled for padded query rows. Used by aux heads.
+        encoder_out_full = torch.zeros(batch_size, num_agents_max, self.src_embed.d_embed,
+                                       device=local_agent_info.device)
 
         # Get mask for non-padded sequences
         non_padded_mask = local_padding_flags.bool()  # (batch_size,)
@@ -424,11 +536,12 @@ class NeighborSelectorTorch(nn.Module):
             decoder_out[non_padded_mask] = decoder_out_np
             h_c_N[non_padded_mask] = h_c_N_np
             sub_att_scores[non_padded_mask] = sub_att_scores_np
+            encoder_out_full[non_padded_mask] = encoder_out
         else:
             print("WARNING All samples are padded in the batch. If this is not expected such as "
                   "parallelized forward, check the padding mask.")
 
-        return sub_att_scores, decoder_out, h_c_N
+        return sub_att_scores, decoder_out, h_c_N, encoder_out_full
 
     def get_context_vector(self, embeddings, pad_tokens, is_from_my_env, use_embeddings_mask=True, debug=False):
         # embeddings: shape (batch_size, num_agents_max==seq_len_src, data_size==d_embed_input)

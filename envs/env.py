@@ -59,6 +59,10 @@ class EnvConfig(BaseModel):
     #                    This allows agents to distinguish front/back/left/right based on their heading
     # If False: relative positions are simple world-frame translations (legacy behavior)
     use_rotated_ego_obs: bool = True
+    # Auxiliary task target exposure: if True, the obs Dict additionally includes 'global_agent_infos'
+    # (flock-center-frame state, shape (num_agents_max, 4)) intended as a regression target for an
+    # auxiliary head on the model. Does not change the policy input; only adds a separate channel.
+    expose_aux_target: bool = False
     # Vicsek specific parameters in the env
     alignment_goal: float = 0.97
     alignment_rate_goal: float = 0.03
@@ -211,7 +215,7 @@ class NeighborSelectionFlockingEnv(gym.Env):
             else:  # ego_centric (default)
                 obs_shape = (self.num_agents_max, self.num_agents_max, self.config.env.obs_dim)
             
-            self.observation_space = Dict({
+            obs_space_dict = {
                 "local_agent_infos": Box(low=-np.inf, high=np.inf,
                                          shape=obs_shape,
                                          dtype=np.float64),
@@ -219,7 +223,16 @@ class NeighborSelectionFlockingEnv(gym.Env):
                 "padding_mask": Box(low=0, high=1, shape=(self.num_agents_max,), dtype=np.bool_),
                 "absolute_headings": Box(low=-np.pi, high=np.pi, shape=(self.num_agents_max,), dtype=np.float64),
                 "is_from_my_env": Box(low=0, high=2, shape=(), dtype=np.float16),
-            })
+            }
+            if self.config.env.expose_aux_target:
+                # Auxiliary task target: flock-center-frame state. Centralized obs is always 4-dim
+                # (no periodic support in _get_centralized_obs), regardless of env.obs_dim.
+                obs_space_dict["global_agent_infos"] = Box(
+                    low=-np.inf, high=np.inf,
+                    shape=(self.num_agents_max, 4),
+                    dtype=np.float64,
+                )
+            self.observation_space = Dict(obs_space_dict)
         elif self.config.env.env_mode == "multi_env":
             self.observation_space = Dict({
                 self.config.env.agent_name_prefix + str(i): Dict({
@@ -302,6 +315,20 @@ class NeighborSelectionFlockingEnv(gym.Env):
         if self.config.env.observation_type == "centralized" and self.config.env.periodic_boundary:
             warnings.warn("Centralized observation with periodic boundary is not fully tested; "
                           "consider using ego_centric observation for periodic boundary environments.")
+
+        # Auxiliary target validation
+        if self.config.env.expose_aux_target:
+            # _get_centralized_obs writes a 4-dim row into a (num_agents_max, obs_dim) array,
+            # which breaks when obs_dim != 4 (periodic mode uses 6 dims for the policy obs).
+            assert not self.config.env.periodic_boundary, (
+                "expose_aux_target=True is incompatible with periodic_boundary=True: "
+                "the centralized (flock-center-frame) target is hard-coded to 4 dims."
+            )
+            if self.config.env.observation_type == "centralized":
+                warnings.warn(
+                    "expose_aux_target=True with observation_type='centralized' is redundant: "
+                    "the policy already sees the flock-center-frame state as its input."
+                )
 
     def show_current_config(self):
         print('-------------------CURRENT CONFIG-------------------')
@@ -1034,6 +1061,13 @@ class NeighborSelectionFlockingEnv(gym.Env):
                    "absolute_headings": absolute_headings,  # (num_agents_max,) in radians [-pi, pi]
                    "is_from_my_env": np.array(True, dtype=np.bool_),
                    }
+            if self.config.env.expose_aux_target:
+                # Recompute centralized obs as the flock-center-frame target for the aux head.
+                # _get_centralized_obs is self-contained and produces (num_agents_max, 4) with zero
+                # rows for padded agents.
+                obs["global_agent_infos"] = self._get_centralized_obs(
+                    state, active_agents_indices, padding_mask
+                )
             return obs
         else:
             raise ValueError(f"self.env_mode: 'single_env' / 'multi_env'; not {self.config.env.env_mode}; in get_obs()")
