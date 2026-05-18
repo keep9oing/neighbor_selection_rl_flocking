@@ -188,7 +188,8 @@ if __name__ == "__main__":
             "entropy_coeff": 0,
             # --- Evaluation ---
             "evaluation_interval": 10,
-            "evaluation_num_episodes": 100,
+            "evaluation_duration": 100,
+            "evaluation_duration_unit": "episodes",
             "evaluation_num_workers": 3,
             "evaluation_config": {
                 "env_config": eval_env_config,
