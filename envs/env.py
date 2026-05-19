@@ -1274,7 +1274,7 @@ class NeighborSelectionFlockingEnv(gym.Env):
             # Get the custom reward
             custom_reward = (self.config.env.acs_train_w_pos * pos_error_reward
                              + self.config.env.acs_train_w_vel * vel_error_reward
-                             - self.config.env.acs_train_w_ctrl * control_cost)
+                             + self.config.env.acs_train_w_ctrl * control_cost)
             return custom_reward
 
         return NotImplemented
