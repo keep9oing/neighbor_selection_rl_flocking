@@ -24,7 +24,7 @@ if __name__ == "__main__":
     # environment configs
     my_config.env.acs_train_w_ctrl = 0.02
     my_config.env.acs_train_w_pos  = 1.0
-    my_config.env.acs_train_w_vel  = 0.2
+    my_config.env.acs_train_w_vel  = 0.2  # overridden by grid_search below
     my_config.env.action_type = "binary_vector"
     my_config.env.agent_name_prefix = "agent_"
     my_config.env.alignment_goal = 0.97
@@ -63,23 +63,22 @@ if __name__ == "__main__":
     my_config.control.sig = 1.0
     my_config.control.speed = 15.0
 
-    # register environment
+    # Build env config dict; inject grid_search on velocity reward weight.
+    # Tune resolves grid_search before passing to each trial, so both training
+    # and eval (via RLlib's recursive merge) inherit the same resolved value.
+    env_config_dict = my_config.dict()
+    env_config_dict["env"]["acs_train_w_vel"] = tune.grid_search(
+        [0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0, 3.0]
+    )
+
     env_config = {
         "seed_id": 42,
-        "config": my_config.dict(),
+        "config": env_config_dict,
     }
     env_name = "neighbor_selection_flocking_env"
     register_env(env_name, lambda cfg: NeighborSelectionFlockingEnv(cfg))
 
-    # eval env config: same except non-fixed episode length (early termination on flocking success)
-    eval_my_config = copy.deepcopy(my_config)
-    eval_my_config.env.use_fixed_episode_length = False
-    eval_env_config = {
-        "seed_id": 0,
-        "config": eval_my_config.dict(),
-    }
-
-    # model config
+    # model config (all fixed — no grid_search here)
     custom_model_config = {
         "d_embed_context": 128,
         "d_embed_input": 128,
@@ -98,13 +97,12 @@ if __name__ == "__main__":
         "share_layers": False,
         "use_FNN_in_decoder": True,
         "use_residual_in_decoder": True,
-        # Auxiliary task
+        # Auxiliary task (fixed from prior sweep best)
         "aux_enabled": True,
         "aux_type": "pair_embedding",
         "aux_loss_coef": 0.3,
         "aux_target_dim": 4,
-        # Critic aux: sweep coef (0 = off, >0 = on with separate critic aux branch)
-        "aux_loss_coef_critic": tune.grid_search([0, 0.3]),
+        "aux_loss_coef_critic": 0.05,
     }
 
     # register model
@@ -112,42 +110,22 @@ if __name__ == "__main__":
     ModelCatalog.register_custom_model(model_name, NeighborSelectionPPORLlib)
 
     # -------------------------------------------------------------------------
-    # PPO hyperparameter choices (with reasoning):
+    # Velocity reward weight sweep.
     #
-    #   num_sgd_iter: 32 → 10
-    #       Fewer SGD passes per batch to reduce overfitting on each rollout and
-    #       speed up wall-clock time per training iteration.
+    # Prior findings:
+    #   - Spatial cohesion achieved (entropy 40 vs goal 42) but velocity
+    #     alignment stuck at ~1.2 (goal 0.1, 12× above threshold).
+    #   - Current acs_train_w_vel=0.2 is 5× weaker than w_pos=1.0.
+    #   - Best PPO settings from prior sweep: lr=1e-4, grad_clip=1.0.
+    #   - Critic aux at 0.3 hurt; trying 0.05 (low enough to avoid
+    #     competing with vf_loss but nonzero for representation benefit).
     #
-    #   rollout_fragment_length: 1024 → 4000
-    #       RLlib counts total transitions per worker (across all vectorized envs).
-    #       4000 / 4 envs = 1000 steps per env = exactly 1 full episode per env per fragment.
-    #
-    #   num_workers=4, num_envs_per_worker=4 → 16 env instances
-    #       Same effective parallelism as before (16 envs). Fewer workers × more
-    #       envs per worker = fewer inter-process comms, slightly more efficient.
-    #
-    #   train_batch_size: 16384 → 16000
-    #       = 4 workers × 4000 fragment_length. Exactly one round of rollouts
-    #       fills one train batch — no waiting for partial rounds.
-    #
-    #   lr: 2e-5 → sweep [5e-5, 1e-4]
-    #       num_sgd_iter dropped 3.2×; higher lr compensates for fewer SGD steps.
-    #       Both values tested: 5e-5 (conservative) and 1e-4 (aggressive).
-    #
-    #   grad_clip: sweep [0.5, 1.0]
-    #       Prior analysis showed critic gradient dominates the shared clip budget,
-    #       compressing actor gradient. grad_clip=1.0 gives the actor more room.
-    #
-    #   sgd_minibatch_size: 256 (unchanged)
-    #       With train_batch_size=16000 and num_sgd_iter=10:
-    #       SGD steps per iter = 16000/256 × 10 = 625 (down from prior 2048).
-    #
-    #   entropy_coeff: 0 (unchanged, low priority per user)
+    # This sweep tests 8 w_vel values from 0.2 (current) to 3.0 (3× spatial).
     # -------------------------------------------------------------------------
 
     tune.run(
         "PPO",
-        name="critic_aux_sweep_260517",
+        name="vel_weight_sweep_260518",
         local_dir="/workspace/test_results",
         checkpoint_freq=10,
         keep_checkpoints_num=8,
@@ -171,9 +149,9 @@ if __name__ == "__main__":
             "train_batch_size": 16000,
             "sgd_minibatch_size": 256,
             "num_sgd_iter": 10,
-            # --- Learning rate (swept) ---
-            "lr": tune.grid_search([5e-5, 1e-4]),
-            "lr_schedule": None,  # use fixed lr (swept); no schedule
+            # --- Learning rate (fixed from best prior trial) ---
+            "lr": 1e-4,
+            "lr_schedule": None,
             # --- PPO ---
             "vf_loss_coeff": 0.5,
             "use_critic": True,
@@ -183,16 +161,25 @@ if __name__ == "__main__":
             "kl_coeff": 0,
             "clip_param": 0.2,
             "vf_clip_param": 256,
-            "grad_clip": tune.grid_search([0.5, 1.0]),
+            "grad_clip": 1.0,
             "kl_target": 0.01,
             "entropy_coeff": 0,
             # --- Evaluation ---
+            # RLlib deep-merges evaluation_config with the base config,
+            # so the swept acs_train_w_vel is inherited by eval workers.
             "evaluation_interval": 10,
             "evaluation_duration": 100,
             "evaluation_duration_unit": "episodes",
             "evaluation_num_workers": 3,
             "evaluation_config": {
-                "env_config": eval_env_config,
+                "env_config": {
+                    "seed_id": 0,
+                    "config": {
+                        "env": {
+                            "use_fixed_episode_length": False,
+                        }
+                    }
+                },
             },
         },
     )
