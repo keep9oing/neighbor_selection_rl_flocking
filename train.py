@@ -22,9 +22,9 @@ if __name__ == "__main__":
     my_config = load_config(default_config_path)
 
     # environment configs
-    my_config.env.acs_train_w_ctrl = 0.02
+    my_config.env.acs_train_w_ctrl = 0.02  # overridden by grid_search below
     my_config.env.acs_train_w_pos  = 1.0
-    my_config.env.acs_train_w_vel  = 0.2  # overridden by grid_search below
+    my_config.env.acs_train_w_vel  = 0.2
     my_config.env.action_type = "binary_vector"
     my_config.env.agent_name_prefix = "agent_"
     my_config.env.alignment_goal = 0.97
@@ -63,12 +63,12 @@ if __name__ == "__main__":
     my_config.control.sig = 1.0
     my_config.control.speed = 15.0
 
-    # Build env config dict; inject grid_search on velocity reward weight.
+    # Build env config dict; inject grid_search on the control-cost weight.
     # Tune resolves grid_search before passing to each trial, so both training
     # and eval (via RLlib's recursive merge) inherit the same resolved value.
     env_config_dict = my_config.dict()
-    env_config_dict["env"]["acs_train_w_vel"] = tune.grid_search(
-        [0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0, 3.0]
+    env_config_dict["env"]["acs_train_w_ctrl"] = tune.grid_search(
+        [0.02, 0.06, 0.12, 0.24]
     )
 
     env_config = {
@@ -97,8 +97,12 @@ if __name__ == "__main__":
         "share_layers": False,
         "use_FNN_in_decoder": True,
         "use_residual_in_decoder": True,
-        # Auxiliary task (fixed from prior sweep best)
-        "aux_enabled": True,
+        # Auxiliary task. aux_enabled is the master switch — it gates the
+        # actor+critic aux branches, forward-pass caching, and custom_loss,
+        # so the coef/type fields below are inert when it is False. Gridded
+        # on/off to test the aux task itself (its prior tuning was done under
+        # the buggy reward and is no longer trusted).
+        "aux_enabled": tune.grid_search([False, True]),
         "aux_type": "pair_embedding",
         "aux_loss_coef": 0.3,
         "aux_target_dim": 4,
@@ -110,22 +114,24 @@ if __name__ == "__main__":
     ModelCatalog.register_custom_model(model_name, NeighborSelectionPPORLlib)
 
     # -------------------------------------------------------------------------
-    # Velocity reward weight sweep.
+    # Control-cost weight × auxiliary-task factorial (Candidate D).
     #
-    # Prior findings:
-    #   - Spatial cohesion achieved (entropy 40 vs goal 42) but velocity
-    #     alignment stuck at ~1.2 (goal 0.1, 12× above threshold).
-    #   - Current acs_train_w_vel=0.2 is 5× weaker than w_pos=1.0.
-    #   - Best PPO settings from prior sweep: lr=1e-4, grad_clip=1.0.
-    #   - Critic aux at 0.3 hurt; trying 0.05 (low enough to avoid
-    #     competing with vf_loss but nonzero for representation benefit).
+    # Context: the control-cost sign-bug fix (commit 20498d6) flipped the
+    # control term from a turning *bonus* into a turning *penalty*. The prior
+    # sweep showed acs_train_w_vel had no effect on velocity entropy (pure
+    # noise across 0.2-3.0) — w_vel was never the lever. Post-fix, w_ctrl is
+    # the meaningful knob: penalizing turning directly pushes toward velocity
+    # alignment.
     #
-    # This sweep tests 8 w_vel values from 0.2 (current) to 3.0 (3× spatial).
+    # 4 (w_ctrl) × 2 (aux on/off) = 8 trials, crossed:
+    #   - aux-OFF row -> clean w_ctrl dose-response (no aux gradient)
+    #   - aux-ON row  -> same dose-response with the aux task active
+    #   - 4 paired OFF/ON diffs -> the aux-task effect, no confound
     # -------------------------------------------------------------------------
 
     tune.run(
         "PPO",
-        name="vel_weight_sweep_260518",
+        name="ctrl_aux_factorial_260519",
         local_dir="/workspace/test_results",
         checkpoint_freq=10,
         keep_checkpoints_num=8,
@@ -145,7 +151,9 @@ if __name__ == "__main__":
             "num_workers": 4,
             "num_envs_per_worker": 4,
             # --- Rollout / batch ---
-            "rollout_fragment_length": 4000,
+            # RLlib needs num_workers * num_envs_per_worker * rollout_fragment_length
+            # to divide train_batch_size; 4 * 4 * 1000 == 16000 exactly.
+            "rollout_fragment_length": 1000,
             "train_batch_size": 16000,
             "sgd_minibatch_size": 256,
             "num_sgd_iter": 10,
@@ -166,7 +174,7 @@ if __name__ == "__main__":
             "entropy_coeff": 0,
             # --- Evaluation ---
             # RLlib deep-merges evaluation_config with the base config,
-            # so the swept acs_train_w_vel is inherited by eval workers.
+            # so the swept acs_train_w_ctrl is inherited by eval workers.
             "evaluation_interval": 10,
             "evaluation_duration": 100,
             "evaluation_duration_unit": "episodes",
