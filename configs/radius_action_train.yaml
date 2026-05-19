@@ -1,0 +1,119 @@
+run:
+  name: radius_action_10agents_fast_100iter
+  local_dir: ./ray_results
+  env_name: neighbor_selection_flocking_radius_env
+  model_name: radius_neighbor_selector_rl
+  checkpoint_freq: 8
+  keep_checkpoints_num: 8
+  checkpoint_at_end: true
+  checkpoint_score_attr: episode_reward_mean
+  checkpoint_score_order: max
+  seed_id: 42
+  num_cpus: 8
+  num_gpus: 1.0
+
+env:
+  is_training: true
+  action_type: radius
+  env_mode: single_env
+  observation_type: ego_centric
+  use_rotated_ego_obs: true
+  agent_name_prefix: agent_
+  task_type: acs
+  num_agents_pool: [20]
+  obs_dim: 4
+  comm_range: null
+  max_time_steps: 1000
+  use_fixed_episode_length: true
+  get_action_hist: false
+  get_state_hist: false
+  ignore_comm_lost_agents: false
+  periodic_boundary: false
+  radius_min: 0.0
+  radius_max: 353.5533905932738
+  radius_clip_actions: true
+  acs_train_w_ctrl: 0.02
+  acs_train_w_pos: 1.0
+  acs_train_w_vel: 0.2
+  alignment_goal: 0.97
+  alignment_rate_goal: 0.03
+  alignment_window_length: 32
+  entropy_p_goal: null
+  entropy_p_rate_goal: 0.1
+  entropy_rate_window_length: 50
+  entropy_v_goal: 0.1
+  entropy_v_rate_goal: 0.2
+
+control:
+  beta: 0.3333333333333333
+  initial_position_bound: 250.0
+  k1: 1.0
+  k2: 3.0
+  lam: 5.0
+  max_turn_rate: 0.5333333333333333
+  r0: 60.0
+  rho: 1.0
+  sig: 1.0
+  speed: 15.0
+
+model:
+  d_embed_input: 128
+  d_ff: 256
+  d_subobs: 4
+  dr_rate: 0.0
+  initial_log_std: -0.5
+  initial_mean: 0.5
+  n_layers_encoder: 3
+  norm_eps: 0.00001
+  num_heads: 4
+  share_layers: false
+
+ppo:
+  framework: torch
+  num_workers: 7
+  num_envs_per_worker: 1
+  rollout_fragment_length: 512
+  train_batch_size: 4096
+  sgd_minibatch_size: 256
+  num_sgd_iter: 8
+  lr: 0.00005
+  lr_schedule:
+    - [0, 0.00005]
+    - [10000000, 0.0000001]
+  vf_loss_coeff: 0.5
+  use_critic: true
+  use_gae: true
+  gamma: 0.99
+  lambda: 0.95
+  kl_coeff: 0
+  clip_param: 0.2
+  vf_clip_param: 256
+  grad_clip: 0.5
+  kl_target: 0.01
+
+stop:
+  training_iteration: 100
+
+smoke:
+  run:
+    name: radius_action_smoke
+    checkpoint_freq: 0
+    keep_checkpoints_num: 1
+    checkpoint_at_end: false
+    num_cpus: 1
+    num_gpus: 0
+  env:
+    num_agents_pool: [5]
+    max_time_steps: 50
+    get_action_hist: true
+  ppo:
+    num_workers: 0
+    num_envs_per_worker: 1
+    rollout_fragment_length: 50
+    train_batch_size: 100
+    sgd_minibatch_size: 50
+    num_sgd_iter: 1
+    lr: 0.0001
+    lr_schedule: null
+  stop:
+    training_iteration: 1

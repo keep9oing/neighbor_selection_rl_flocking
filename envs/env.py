@@ -39,6 +39,9 @@ class EnvConfig(BaseModel):
     agent_name_prefix: str = 'agent_'
     env_mode: str = 'single_env'
     action_type: str = 'binary_vector'
+    radius_min: float = 0.0
+    radius_max: Optional[float] = None
+    radius_clip_actions: bool = True
     num_agents_pool: List[conint(ge=1)]  # Must clarify it !!
     dt: float = 0.1
     comm_range: Optional[float] = None
@@ -174,6 +177,7 @@ class NeighborSelectionFlockingEnv(gym.Env):
         # ACS hist
         self.spatial_entropy_hist = None
         self.velocity_entropy_hist = None
+        self._last_radius_diagnostics = None
 
         self._validate_config()
 
@@ -184,9 +188,13 @@ class NeighborSelectionFlockingEnv(gym.Env):
                 self.action_dtype = np.int8
                 self.action_space = Box(low=0, high=1,
                                         shape=(self.num_agents_max, self.num_agents_max), dtype=self.action_dtype)
+            elif self.config.env.action_type == "radius":
+                self.action_dtype = np.float32
+                self.action_space = Box(low=0.0, high=1.0,
+                                        shape=(self.num_agents_max,), dtype=self.action_dtype)
             else:
-                raise NotImplementedError("action_type must be binary_vector. "
-                                          "The radius and continuous_vector are still in alpha, sorry.")
+                raise NotImplementedError("action_type must be binary_vector or radius. "
+                                          "The continuous_vector action_type is not implemented yet.")
         elif self.config.env.env_mode == "multi_env":
             print("WARNING (env.__init__): multi_env is experimental; not fully implemented yet")
             if self.config.env.action_type == "binary_vector":
@@ -303,6 +311,11 @@ class NeighborSelectionFlockingEnv(gym.Env):
             warnings.warn("Centralized observation with periodic boundary is not fully tested; "
                           "consider using ego_centric observation for periodic boundary environments.")
 
+        if self.config.env.radius_max is None:
+            self.config.env.radius_max = self.config.control.initial_position_bound
+        assert self.config.env.radius_min >= 0.0, "radius_min must be >= 0"
+        assert self.config.env.radius_max >= self.config.env.radius_min, "radius_max must be >= radius_min"
+
     def show_current_config(self):
         print('-------------------CURRENT CONFIG-------------------')
         print(pretty_print(self.config.dict()))
@@ -361,6 +374,7 @@ class NeighborSelectionFlockingEnv(gym.Env):
         self.state = {"agent_states": agent_states, "neighbor_masks": neighbor_masks, "padding_mask": padding_mask}
         self.initial_state = self.state
         self.has_lost_comm = False
+        self._last_radius_diagnostics = None
 
         # Get relative state
         self.rel_state = self.get_relative_state(state=self.state)
@@ -398,6 +412,7 @@ class NeighborSelectionFlockingEnv(gym.Env):
                 agent_states=agent_states, padding_mask=padding_mask, communication_range=self.config.env.comm_range)[0]
         self.state = {"agent_states": agent_states, "neighbor_masks": neighbor_masks, "padding_mask": padding_mask}
         self.has_lost_comm = False
+        self._last_radius_diagnostics = None
 
         # Get relative state
         self.rel_state = self.get_relative_state(state=self.state)
@@ -464,6 +479,14 @@ class NeighborSelectionFlockingEnv(gym.Env):
             "original_reward": _reward,
             "comm_loss_agents": comm_loss_agents,
         }
+        if self.config.env.action_type == "radius" and self._last_radius_diagnostics is not None:
+            info.update({
+                "radius_mean": self._last_radius_diagnostics["radius_mean"],
+                "radius_min": self._last_radius_diagnostics["radius_min"],
+                "radius_max": self._last_radius_diagnostics["radius_max"],
+                "radius_action_mean": self._last_radius_diagnostics["radius_action_mean"],
+                "selected_neighbor_count_mean": self._last_radius_diagnostics["selected_neighbor_count_mean"],
+            })
         info = self.get_extra_info(info, next_state, next_rel_state, control_inputs, rewards, done)
         if self.config.env.get_state_hist:
             self.agent_states_hist[self.time_step] = next_state["agent_states"]
@@ -546,15 +569,27 @@ class NeighborSelectionFlockingEnv(gym.Env):
             assert action.shape == (self.num_agents_max, self.num_agents_max), \
                 "action must be a ndarray of shape (num_agents_max, num_agents_max)"
 
-        # Ensure the diagonal elements are all ones (all with self-loops); if not, set them to ones
-        if not np.all(np.diag(action) == 1):
-            np.fill_diagonal(action, 1)  # Directly modifies the action array to set diagonal elements to 1
-            print("WARNING (env.validate_action): diag(action) not all 1; Self-loops fixed in 'action'.")
+            # Ensure the diagonal elements are all ones (all with self-loops); if not, set them to ones
+            if not np.all(np.diag(action) == 1):
+                np.fill_diagonal(action, 1)  # Directly modifies the action array to set diagonal elements to 1
+                print("WARNING (env.validate_action): diag(action) not all 1; Self-loops fixed in 'action'.")
+        elif self.config.env.action_type == "radius":
+            assert isinstance(action, np.ndarray), "action must be a numpy ndarray"
+            assert action.shape == (self.num_agents_max, self.num_agents_max), \
+                "action must be a ndarray of shape (num_agents_max, num_agents_max)"
+            active_agents_indices = np.nonzero(padding_mask)[0]
+            if not np.all(action[active_agents_indices, active_agents_indices]):
+                action[active_agents_indices, active_agents_indices] = True
+                print("WARNING (env.validate_action): active self-loops fixed in radius-derived action.")
 
         # Check action value based on the neighbor_mask and padding_mask
         # Note: your model might output a masked action. If that's not available, you can ignore this part.
         assert np.all((neighbor_masks | ~action)), "action[i, j] == 1 must not found if neighbor_mask[i, j] == 0"
-        assert np.all((padding_mask[:, None] | ~action)), "action[i, j] == 1 must not found if padding_mask[j] == 0"
+        if self.config.env.action_type == "radius":
+            padding_mask_2d = padding_mask[:, np.newaxis] & padding_mask[np.newaxis, :]
+            assert np.all((padding_mask_2d | ~action)), "radius action must not select padding rows or columns"
+        else:
+            assert np.all((padding_mask[:, None] | ~action)), "action[i, j] == 1 must not found if padding_mask[j] == 0"
 
         # # Efficiently check for rows with all zeros (excluding self-loops)
         # if self.time_step != 0:
@@ -578,21 +613,48 @@ class NeighborSelectionFlockingEnv(gym.Env):
             return action_in_another_type
         elif self.config.env.action_type == "radius":
             # action_in_another_type: ndarray of shape (num_agents_max, )
-            # # action_in_another_type[i] is the radius of the communication range of agent i
+            # # action_in_another_type[i] is agent i's normalized interaction radius in [0, 1].
+            radius_action = np.asarray(action_in_another_type, dtype=np.float32)
+            assert radius_action.shape == (self.num_agents_max,), \
+                "radius action must be a ndarray of shape (num_agents_max,)"
 
-            # Check if the radius is positive and less than the communication range (non-padded agents only)
-            assert np.all(action_in_another_type[self.state["padding_mask"]] > 0), \
-                "action_in_another_type[i] must be > 0 for all non-padded agents"
-            assert np.all(action_in_another_type[self.state["padding_mask"]] <= 1), \
-                "action_in_another_type[i] must be <= self.comm_range for all non-padded agents"
+            padding_mask = self.state["padding_mask"]
+            if self.config.env.radius_clip_actions:
+                radius_action = np.clip(radius_action, 0.0, 1.0)
+            else:
+                assert np.all(radius_action[padding_mask] >= 0.0), \
+                    "radius action must be >= 0 for all non-padded agents"
+                assert np.all(radius_action[padding_mask] <= 1.0), \
+                    "radius action must be <= 1 for all non-padded agents"
 
-            # Set the action
-            agent_wise_comm_range = self.config.env.comm_range * action_in_another_type[
-                self.state["padding_mask"], np.newaxis]  # (num_agents, 1)
-            action_in_binary = self.compute_neighbor_agents(
-                agent_states=self.state["agent_states"], padding_mask=self.state["padding_mask"],
-                communication_range=agent_wise_comm_range)[0]
-            return action_in_binary  # (num_agents_max, num_agents_max)
+            radius_min = self.config.env.radius_min
+            radius_max = self.config.env.radius_max
+            physical_radii = radius_min + radius_action * (radius_max - radius_min)
+
+            rel_state = self.get_relative_state(state=self.state)
+            rel_agent_dists = rel_state["rel_agent_dists"]
+            disk_mask = rel_agent_dists <= physical_radii[:, np.newaxis]
+            padding_mask_2d = padding_mask[:, np.newaxis] & padding_mask[np.newaxis, :]
+            selected_network = self.state["neighbor_masks"] & disk_mask & padding_mask_2d
+
+            active_agents_indices = np.nonzero(padding_mask)[0]
+            selected_network[active_agents_indices, active_agents_indices] = True
+
+            active_radii = physical_radii[padding_mask]
+            active_radius_actions = radius_action[padding_mask]
+            selected_neighbor_counts = selected_network[padding_mask].sum(axis=1)
+            self._last_radius_diagnostics = {
+                "radius_values": physical_radii.copy(),
+                "radius_actions": radius_action.copy(),
+                "selected_neighbor_counts": selected_neighbor_counts.copy(),
+                "radius_mean": float(active_radii.mean()),
+                "radius_min": float(active_radii.min()),
+                "radius_max": float(active_radii.max()),
+                "radius_action_mean": float(active_radius_actions.mean()),
+                "selected_neighbor_count_mean": float(selected_neighbor_counts.mean()),
+            }
+
+            return selected_network  # (num_agents_max, num_agents_max)
         elif self.config.env.action_type == "continuous_vector":
             raise NotImplementedError("continuous_vector action_type is not implemented yet")
         return None
@@ -1274,7 +1336,7 @@ class NeighborSelectionFlockingEnv(gym.Env):
             # Get the custom reward
             custom_reward = (self.config.env.acs_train_w_pos * pos_error_reward
                              + self.config.env.acs_train_w_vel * vel_error_reward
-                             - self.config.env.acs_train_w_ctrl * control_cost)
+                             + self.config.env.acs_train_w_ctrl * control_cost)
             return custom_reward
 
         return NotImplemented
