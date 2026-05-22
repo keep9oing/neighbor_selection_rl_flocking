@@ -26,6 +26,7 @@ if __name__ == "__main__":
     my_config.env.acs_train_w_ctrl = 0.02
     my_config.env.acs_train_w_pos  = 1.0
     my_config.env.acs_train_w_vel  = 0.2
+    my_config.env.acs_train_w_conn = 0.0
     my_config.env.action_type = "binary_vector"
     my_config.env.agent_name_prefix = "agent_"
     my_config.env.alignment_goal = 0.97
@@ -88,7 +89,7 @@ if __name__ == "__main__":
         "n_layers_encoder": 3,
         "norm_eps": 1e-05,
         "num_heads": 4,
-        "scale_factor": 0.002,
+        "scale_factor": 0.03,
         "share_layers": False,
         "use_FNN_in_decoder": True,
         "use_residual_in_decoder": True,
@@ -112,14 +113,20 @@ if __name__ == "__main__":
     # enabled to provide additional encoder representation pressure.
     # -------------------------------------------------------------------------
 
+    # --- Scale factor sweep (Phase 7b) ---
+    # 3 trials: sf ∈ {0.07, 0.1, 0.15}, clean reward (no conn_cost)
+    # Phase 5 showed sf=0.05 (delta=-44, best learning) and sf=0.2 (collapse).
+    # Testing the gap: sf=0.07-0.15 should learn faster without collapse.
+    # Original reward weights: w_pos=1.0, w_vel=0.2, w_ctrl=0.02, w_conn=0.
+
     tune.run(
         GradLoggingPPO,
-        name="grad_fix_lr5e4_aux_260520",
+        name="sf_sweep_260522",
         local_dir="/workspace/test_results",
         checkpoint_freq=10,
         keep_checkpoints_num=3,
         checkpoint_at_end=True,
-        stop={"training_iteration": 100},
+        stop={"training_iteration": 150},
         config={
             "env": env_name,
             "env_config": env_config,
@@ -127,15 +134,16 @@ if __name__ == "__main__":
             "callbacks": FlockingCallbacks,
             "model": {
                 "custom_model": model_name,
-                "custom_model_config": custom_model_config,
+                "custom_model_config": {
+                    **custom_model_config,
+                    "scale_factor": tune.grid_search([0.07, 0.1, 0.15]),
+                },
             },
             # --- Resources (per trial) ---
             "num_gpus": 0.5,
             "num_workers": 4,
             "num_envs_per_worker": 4,
             # --- Rollout / batch ---
-            # RLlib needs num_workers * num_envs_per_worker * rollout_fragment_length
-            # to divide train_batch_size; 4 * 4 * 1000 == 16000 exactly.
             "rollout_fragment_length": 1000,
             "train_batch_size": 16000,
             "sgd_minibatch_size": 256,
@@ -155,7 +163,7 @@ if __name__ == "__main__":
             "grad_clip": None,
             "kl_target": 0.01,
             "entropy_coeff": 0,
-            # --- Evaluation (disabled for diagnostic) ---
+            # --- Evaluation (disabled) ---
             "evaluation_interval": None,
         },
     )

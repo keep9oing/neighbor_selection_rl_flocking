@@ -76,6 +76,7 @@ class EnvConfig(BaseModel):
     acs_train_w_pos: float = 1.0
     acs_train_w_vel: float = 0.2
     acs_train_w_ctrl: float = 0.02
+    acs_train_w_conn: float = 0.0
     # ACS neighbor selection option: if True, neighbor selection (action) applies only to heading (alignment) control,
     # while cohesion/separation uses the original (full) neighbor network
     apply_to_heading_only: bool = False
@@ -463,6 +464,7 @@ class NeighborSelectionFlockingEnv(gym.Env):
         joint_action = self.to_binary_action(joint_action)  # (num_agents_max, num_agents_max)
         self.validate_action(action=joint_action,
                              neighbor_masks=state["neighbor_masks"], padding_mask=state["padding_mask"])
+        self.current_action = joint_action
 
         # Step the environment in *single agent* setting!, which may be faster due to vectorization-like things
         # # s` = T(s, a)
@@ -490,6 +492,7 @@ class NeighborSelectionFlockingEnv(gym.Env):
             "alignment": self.alignment_hist[self.time_step] if self.config.env.task_type == "vicsek" else None,
             "original_reward": _reward,
             "comm_loss_agents": comm_loss_agents,
+            "conn_ratio": getattr(self, '_conn_ratio', None),
         }
         info = self.get_extra_info(info, next_state, next_rel_state, control_inputs, rewards, done)
         if self.config.env.get_state_hist:
@@ -1305,10 +1308,26 @@ class NeighborSelectionFlockingEnv(gym.Env):
             control_cost = rewards.sum() / self.num_agents
             control_cost = control_cost + (rho * self.config.env.dt)
 
+            # Connection cost: penalize fraction of selected edges
+            conn_cost = 0.0
+            w_conn = self.config.env.acs_train_w_conn
+            if w_conn > 0 and hasattr(self, 'current_action'):
+                padding_mask = state["padding_mask"]
+                N = int(padding_mask.sum())
+                if N > 1:
+                    real_edges = self.current_action[padding_mask][:, padding_mask]
+                    num_edges = int(real_edges.sum()) - N
+                    max_edges = N * (N - 1)
+                    self._conn_ratio = num_edges / max_edges
+                    conn_cost = -self._conn_ratio
+                else:
+                    self._conn_ratio = 0.0
+
             # Get the custom reward
             custom_reward = (self.config.env.acs_train_w_pos * pos_error_reward
                              + self.config.env.acs_train_w_vel * vel_error_reward
-                             + self.config.env.acs_train_w_ctrl * control_cost)
+                             + self.config.env.acs_train_w_ctrl * control_cost
+                             + w_conn * conn_cost)
             return custom_reward
 
         return NotImplemented

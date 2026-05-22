@@ -15,6 +15,10 @@ class FlockingCallbacks(DefaultCallbacks):
         if vl is not None:
             episode.custom_metrics["final_velocity_entropy"] = float(vl)
 
+        cr = info.get("conn_ratio")
+        if cr is not None:
+            episode.custom_metrics["final_conn_ratio"] = float(cr)
+
         max_steps = 1000
         try:
             env = base_env.get_sub_environments()[0]
