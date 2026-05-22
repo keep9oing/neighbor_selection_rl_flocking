@@ -113,7 +113,7 @@ Pure fully-connected deterministic ACS (10 episodes):
 ## Current State (2026-05-22)
 
 ### Running experiments
-**`sf_sweep_260522`** — 3 trials (sf=0.07, 0.1, 0.15), 150 iters target. Running on GPUs 1 & 3 via `CUDA_VISIBLE_DEVICES=1,3 python train.py`. PID: check `ps aux | grep train.py`. Only sf=0.15 is learning. At iter 16: entropy≈198, vel_ent≈1.35 (plateaued around 1.2–1.4 since iter 7), sp_ent≈39.6. The other two (sf=0.07, 0.1) are dead (entropy=263.3 after 9 iters). Checkpoint at iter 10 exists and should be evaluated.
+**`sf_sweep_260522`** — 3 trials (sf=0.07, 0.1, 0.15), 150 iters target. Running on GPUs 1 & 3 via `CUDA_VISIBLE_DEVICES=1,3 python train.py`. PID: check `ps aux | grep train.py`. Only sf=0.15 is learning. At iter 20: entropy=192.8 (still decreasing), vel_ent=1.22 (broke out of 1.3–1.4 plateau), sp_ent=39.7, reward=-116.1. The other two (sf=0.07, 0.1) are dead (entropy=263.3 after 12 iters). Checkpoints at iter 10 and 20 exist — **evaluate iter 20 checkpoint next session.**
 
 ### Git state
 Branch `exp/autonomous-research`. Working tree has uncommitted changes: connection cost implementation in env.py, callbacks.py update, train.py for sf sweep, check_sweep.py utility.
