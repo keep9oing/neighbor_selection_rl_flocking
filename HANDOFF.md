@@ -99,9 +99,10 @@ Tested the gap between sf=0.05 (Phase 5, delta=-44/100 iters) and sf=0.2 (Phase 
   - Iter 1–3: entropy 163.6→169.3→184.3, vel_ent 1.76→1.22→1.07 (best ego-centric vel_ent ever)
   - Iter 4–7: entropy rebounded to ~200 (PPO clipping regulating the initial overshoot), then stabilized. vel_ent oscillated but resumed improvement: 1.40→1.32→1.26→1.13
   - sp_ent stable at 39.7–39.9 throughout — no swarm disruption
-  - **The oscillation is damping**: entropy settling ~200, vel_ent trending downward
+  - **The oscillation damped by iter 8.** By iter 14: entropy=198.3 (steady decrease), vel_ent=1.23, sp_ent=39.4, reward=-107.4. The policy is in a stable learning regime.
+  - **sf=0.07 and sf=0.1:** Completely dead after 8 iterations. Entropy stuck at 263.3.
 - **Key finding:** There is a sharp PHASE TRANSITION between sf=0.1 (no learning at all) and sf=0.15 (immediate massive learning). The threshold determines whether the attention-score gradients are strong enough to escape the uniform attractor in a single PPO update.
-- **Status:** Still running. Need to monitor whether vel_ent continues to decrease toward FC-ACS baseline (0.10) or plateaus. Need to evaluate checkpoint to determine if policy is approaching FC or discovering non-FC strategies.
+- **Status:** Still running (target 150 iters). vel_ent trending toward 1.0 but FC-ACS baseline is 0.10 — still a large gap. Need to evaluate checkpoint to determine if policy is approaching FC or discovering non-FC strategies.
 
 ### FC-ACS Baseline Performance
 Pure fully-connected deterministic ACS (10 episodes):
@@ -112,7 +113,7 @@ Pure fully-connected deterministic ACS (10 episodes):
 ## Current State (2026-05-22)
 
 ### Running experiments
-**`sf_sweep_260522`** — 3 trials (sf=0.07, 0.1, 0.15), 150 iters target. Running on GPUs 1 & 3 via `CUDA_VISIBLE_DEVICES=1,3 python train.py`. PID: check `ps aux | grep train.py`. Only sf=0.15 is learning. At iter 7: entropy≈200, vel_ent≈1.13, sp_ent≈39.7. The other two (sf=0.07, 0.1) are flat at max entropy.
+**`sf_sweep_260522`** — 3 trials (sf=0.07, 0.1, 0.15), 150 iters target. Running on GPUs 1 & 3 via `CUDA_VISIBLE_DEVICES=1,3 python train.py`. PID: check `ps aux | grep train.py`. Only sf=0.15 is learning. At iter 16: entropy≈198, vel_ent≈1.35 (plateaued around 1.2–1.4 since iter 7), sp_ent≈39.6. The other two (sf=0.07, 0.1) are dead (entropy=263.3 after 9 iters). Checkpoint at iter 10 exists and should be evaluated.
 
 ### Git state
 Branch `exp/autonomous-research`. Working tree has uncommitted changes: connection cost implementation in env.py, callbacks.py update, train.py for sf sweep, check_sweep.py utility.
