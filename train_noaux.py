@@ -92,7 +92,7 @@ if __name__ == "__main__":
         "share_layers": False,
         "use_FNN_in_decoder": True,
         "use_residual_in_decoder": True,
-        "aux_enabled": True,
+        "aux_enabled": False,
         "aux_type": "pair_embedding",
         "aux_loss_coef": 0.3,
         "aux_target_dim": 4,
@@ -104,17 +104,14 @@ if __name__ == "__main__":
     ModelCatalog.register_custom_model(model_name, NeighborSelectionPPORLlib)
 
     # -------------------------------------------------------------------------
-    # Post-diagnostic fix: grad_clip=None + lr=5e-4 + aux=True.
-    #
-    # Diagnostic confirmed: grad_clip=1.0 throttles the actor by ~20x (total
-    # gnorm ~20, critic/actor ratio ~200:1). Removing clip + raising lr to
-    # escape the cold start (near-uniform policy has tiny gradients). Aux task
-    # enabled to provide additional encoder representation pressure.
+    # Paired control: grad_clip=None + lr=5e-4, aux=OFF.
+    # Same as grad_fix_lr5e4_aux except aux_enabled=False.
+    # Paired with the aux=ON trial to isolate the aux task's effect.
     # -------------------------------------------------------------------------
 
     tune.run(
         GradLoggingPPO,
-        name="grad_fix_lr5e4_aux_260520",
+        name="grad_fix_lr5e4_noaux_260520",
         local_dir="/workspace/test_results",
         checkpoint_freq=10,
         keep_checkpoints_num=3,

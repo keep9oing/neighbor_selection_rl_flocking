@@ -1,4 +1,5 @@
 import copy
+import os
 
 import ray
 from ray import tune
@@ -10,19 +11,19 @@ from models.ppo import NeighborSelectionPPORLlib
 from callbacks import FlockingCallbacks
 from grad_logging_ppo import GradLoggingPPO
 
+RESTORE_CKPT = (
+    "/workspace/test_results/grad_fix_lr5e4_aux_260520/"
+    "GradLoggingPPO_neighbor_selection_flocking_env_d90d1_00000_0_2026-05-20_22-18-37/"
+    "checkpoint_000100"
+)
+LR_TAG = os.environ.get("RESUME_LR", "5e-4")
+RESUME_LR = float(LR_TAG)
+
 if __name__ == "__main__":
 
-    enable_debugging = False
-    # enable_debugging = True
-
-    if enable_debugging:
-        ray.init(local_mode=True)
-
-    # Set up environment configuration
     default_config_path = "./envs/default_env_config.yaml"
     my_config = load_config(default_config_path)
 
-    # environment configs
     my_config.env.acs_train_w_ctrl = 0.02
     my_config.env.acs_train_w_pos  = 1.0
     my_config.env.acs_train_w_vel  = 0.2
@@ -52,7 +53,6 @@ if __name__ == "__main__":
     my_config.env.use_fixed_episode_length = True
     my_config.env.expose_aux_target = True
 
-    # control config:
     my_config.control.beta = 1/3
     my_config.control.initial_position_bound = 250.0
     my_config.control.k1 = 1.0
@@ -73,7 +73,6 @@ if __name__ == "__main__":
     env_name = "neighbor_selection_flocking_env"
     register_env(env_name, lambda cfg: NeighborSelectionFlockingEnv(cfg))
 
-    # model config (all fixed)
     custom_model_config = {
         "d_embed_context": 128,
         "d_embed_input": 128,
@@ -99,27 +98,23 @@ if __name__ == "__main__":
         "aux_loss_coef_critic": 0.05,
     }
 
-    # register model
     model_name = "neighbor_selector_rl"
     ModelCatalog.register_custom_model(model_name, NeighborSelectionPPORLlib)
 
     # -------------------------------------------------------------------------
-    # Post-diagnostic fix: grad_clip=None + lr=5e-4 + aux=True.
-    #
-    # Diagnostic confirmed: grad_clip=1.0 throttles the actor by ~20x (total
-    # gnorm ~20, critic/actor ratio ~200:1). Removing clip + raising lr to
-    # escape the cold start (near-uniform policy has tiny gradients). Aux task
-    # enabled to provide additional encoder representation pressure.
+    # Resume from iter-100 aux=ON checkpoint with potentially different lr.
+    # num_workers=16, num_envs_per_worker=1 for faster data collection.
     # -------------------------------------------------------------------------
 
     tune.run(
         GradLoggingPPO,
-        name="grad_fix_lr5e4_aux_260520",
+        name=f"resume_lr{LR_TAG}_aux_260521",
         local_dir="/workspace/test_results",
+        restore=RESTORE_CKPT,
         checkpoint_freq=10,
         keep_checkpoints_num=3,
         checkpoint_at_end=True,
-        stop={"training_iteration": 100},
+        stop={"training_iteration": 150},
         config={
             "env": env_name,
             "env_config": env_config,
@@ -129,21 +124,16 @@ if __name__ == "__main__":
                 "custom_model": model_name,
                 "custom_model_config": custom_model_config,
             },
-            # --- Resources (per trial) ---
             "num_gpus": 0.5,
-            "num_workers": 4,
-            "num_envs_per_worker": 4,
-            # --- Rollout / batch ---
-            # RLlib needs num_workers * num_envs_per_worker * rollout_fragment_length
-            # to divide train_batch_size; 4 * 4 * 1000 == 16000 exactly.
+            "num_workers": 16,
+            "num_envs_per_worker": 1,
+            # 16 * 1 * 1000 == 16000
             "rollout_fragment_length": 1000,
             "train_batch_size": 16000,
             "sgd_minibatch_size": 256,
             "num_sgd_iter": 10,
-            # --- Learning rate ---
-            "lr": 5e-4,
+            "lr": RESUME_LR,
             "lr_schedule": None,
-            # --- PPO ---
             "vf_loss_coeff": 0.5,
             "use_critic": True,
             "use_gae": True,
@@ -155,7 +145,6 @@ if __name__ == "__main__":
             "grad_clip": None,
             "kl_target": 0.01,
             "entropy_coeff": 0,
-            # --- Evaluation (disabled for diagnostic) ---
             "evaluation_interval": None,
         },
     )
