@@ -114,7 +114,7 @@ Tested the gap between sf=0.05 (Phase 5) and sf=0.2 (Phase 5, collapse).
 ## Current State (2026-05-23)
 
 ### Running experiments
-None. All experiments stopped.
+None.
 
 ### Git state
 Branch `exp/autonomous-research`. Modified: `evaluate_checkpoint.py`, `train.py`, `envs/env.py`.
@@ -125,7 +125,8 @@ All under `/workspace/test_results/`. Key ones:
 - `sf03_fresh_lr2e4_260522/` — sf=0.03. Converged to near-FC (Phase 6).
 - `conn_cost_sweep_260522/` — Connection cost sweep. Zero learning (Phase 7a).
 - `sf_sweep_260522/` — sf {0.07, 0.1, 0.15}. sf=0.15 learned then collapsed (Phase 7b). **Checkpoint 70 evaluated: exactly FC (19.0 edges/agent).**
-- `wctrl_sweep_260523/` — w_ctrl {0.3, 0.5, 1.0}. **Running.**
+- `wctrl_sweep_260523/` — w_ctrl {0.3, 0.5, 1.0}. Entropy stuck at 263 (entropy_coeff too strong).
+- `topk10_260523/` — top-K=10 v1 (collapsed) and v2 (bias=+2.0, checkpoints at 10/20/30).
 
 ### What has been done this session
 - **Modified `evaluate_checkpoint.py`** to support ego-centric model (`NeighborSelectionPPORLlib`). Auto-detects observation type from checkpoint params. Added mean_edges_per_agent and flocking_success metrics.
@@ -134,7 +135,9 @@ All under `/workspace/test_results/`. Key ones:
 - **Ran K-nearest diagnostic**: K=10 gets 23% less control cost than FC — confirmed selectivity IS beneficial.
 - **Ran 9 training experiments** testing w_ctrl sweep, entropy_coeff, sf values, batch sizes, lr schedules, fine-tuning from FC checkpoint, and curriculum approaches. All failed due to the bistability of the binary action space.
 - **Diagnosed the fundamental problem**: the independent binary action space with sf-scaled logits creates two strong attractors (FC and empty) with no stable intermediate. This is an architecture problem, not a reward problem.
-- **Identified clear next step**: Top-K action space to eliminate bistability.
+- **Implemented top-K action space** in `models/ppo.py`: `top_k` config parameter masks `attention_scores_to_logits()` to allow only K highest-scoring neighbors. +2.0 bias prevents empty-attractor collapse.
+- **Tested top-K=10**: FC attractor eliminated, conn stable at ~0.50 for 40 iters. But vel_ent worse than random top-K selection — credit assignment is the remaining bottleneck. Collapsed after ~48 iters when model overcame the +2.0 bias.
+- **Identified next step**: Initialize top-K from K-nearest heuristic (warm start from vel_ent=0.23) rather than learning from scratch.
 
 ## Autonomous Session Protocol (`/goal`)
 
@@ -243,14 +246,27 @@ Any intermediate state is **unstable** — sf=0.15's gradient pushes each edge t
 2. w_ctrl=0.2 correctly incentivizes selectivity (verified: all w_ctrl>0 experiments moved away from FC)
 3. But the policy can only reach FC or empty, never the optimal intermediate (~10 edges/agent)
 
-### Recommended next approach: Top-K action space
-Replace the 380 independent binary decisions with "select exactly K neighbors per agent." This:
-1. **Forces non-FC by construction** (K < N-1)
-2. **Eliminates bistability** — no binary decision boundary per edge
-3. **Reduces action space** from 2^380 to C(19,K) per agent
-4. **Implementation path:**
-   - Replace `attention_scores_to_logits()` with top-K selection from raw attention scores
-   - Use Gumbel-softmax or Plackett-Luce for differentiable K-subset sampling
-   - K can be a hyperparameter (start with K=10 based on the diagnostic) or learned
-   - The encoder/decoder architecture stays the same — only the output layer changes
-5. **Alternative: continuous attention weights** — output weights in [0,1] for each edge, use weighted average in the ACS controller instead of binary mask. This keeps the existing architecture but requires env changes to support soft selection.
+### Phase 9: Top-K action space (implemented and tested)
+**Implementation** (models/ppo.py): Added `top_k` parameter to `custom_model_config`. In `attention_scores_to_logits()`, masks out non-top-K attention scores per row, adds +2.0 bias to top-K positions. Non-top-K get -1e9 (blocked). Minimal change — no env/RLlib modifications needed.
+
+**`topk10_260523` v1** (top-K=10, sf=0.15, w_ctrl=0.02, no bias on top-K):
+- Top-K as CANDIDATES (model can choose to not select any). Collapsed to conn=0.027 (~0.5 edges/agent) by iter 30. Same empty attractor — model learned to reject all candidates. Killed.
+
+**`topk10_260523` v2** (top-K=10, sf=0.15, w_ctrl=0.02, +2.0 bias):
+- **Conn stable at ~0.50 for 40 iterations** — the FC attractor is eliminated, and bias prevents empty attractor.
+- vel_ent trajectory: 3.8 (iter 1, random top-K) → 10.5 (iter 5, worse) → 5.0 (iter 20, improving) → 8.4 (iter 40, worsening) → collapse at iter 48 (model overcame +2.0 bias).
+- **Formal eval of checkpoint 30**: vel_ent=10.5±4.7, reward=-684±39, edges=10.0. Much worse than FC (vel_ent=0.13, reward=-277).
+- **Critical finding: random top-K selection (iter 1, vel_ent=3.8) outperforms the trained policy (vel_ent=5-8).** The PPO gradient doesn't provide useful per-edge credit assignment — the model learns to confidently select BAD neighbors.
+
+### Diagnosis: credit assignment is the core remaining problem
+The top-K constraint successfully eliminates the FC/empty bistability, but the model can't learn WHICH K neighbors are best because:
+1. **Per-edge reward signal is too dilute**: each edge contributes ~1/10 of the alignment change. PPO's advantage estimates can't reliably attribute reward to individual edge decisions.
+2. **Random selection within top-K is a strong baseline**: by chance, random top-K includes enough useful neighbors for reasonable alignment (vel_ent=3.8). The trained policy's confident-but-wrong selections are worse.
+3. **Entropy collapse to 0 prevents recovery**: once the policy becomes deterministic about a bad selection, it can't explore better options.
+
+### Recommended next approaches (prioritized)
+1. **Initialize top-K from K-nearest heuristic** — start with a good selection (vel_ent=0.23) and fine-tune. The model would learn to IMPROVE on K-nearest, not discover it from scratch. Implementation: add distance-based initialization bias to attention scores.
+2. **Stronger anti-collapse bias (+5.0 or higher)** — prevents the model from overcoming the selection bias, keeping conn stable longer. Combined with lower lr (1e-4) for slower, more stable learning.
+3. **Per-agent reward shaping** — instead of one scalar reward, give each agent a separate reward signal based on its individual alignment improvement. This provides clearer credit assignment.
+4. **Continuous attention weights** — replace binary select/don't-select with continuous weights in [0,1]. The ACS controller uses weighted averages instead of binary masks. This gives smooth gradients everywhere. Requires env modification.
+5. **Longer training with exploration** — use entropy_coeff=0.001 (scales correctly for 19.1-nat max entropy with top-K) to maintain exploration, prevent entropy collapse, and train for 200+ iterations.
