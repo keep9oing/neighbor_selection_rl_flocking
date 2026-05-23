@@ -113,30 +113,39 @@ if __name__ == "__main__":
     # enabled to provide additional encoder representation pressure.
     # -------------------------------------------------------------------------
 
-    # --- Scale factor sweep (Phase 7b) ---
-    # 3 trials: sf ∈ {0.07, 0.1, 0.15}, clean reward (no conn_cost)
-    # Phase 5 showed sf=0.05 (delta=-44, best learning) and sf=0.2 (collapse).
-    # Testing the gap: sf=0.07-0.15 should learn faster without collapse.
-    # Original reward weights: w_pos=1.0, w_vel=0.2, w_ctrl=0.02, w_conn=0.
+    # --- Phase 8: w_ctrl sweep (2026-05-23) ---
+    # Checkpoint 70 eval: policy is exactly FC (19.0 edges/agent). With w_ctrl=0.02,
+    # control cost savings from selectivity are invisible in the reward (~0.003/step).
+    # Hypothesis: higher w_ctrl creates tension between alignment (favors FC) and
+    # control cost (favors selectivity). sf=0.15 with lr decay + entropy reg for stability.
 
     tune.run(
         GradLoggingPPO,
-        name="sf_sweep_260522",
+        name="wctrl_sweep_260523",
         local_dir="/workspace/test_results",
         checkpoint_freq=10,
         keep_checkpoints_num=3,
         checkpoint_at_end=True,
-        stop={"training_iteration": 150},
+        stop={"training_iteration": 100},
         config={
             "env": env_name,
-            "env_config": env_config,
+            "env_config": {
+                "seed_id": 42,
+                "config": {
+                    **env_config_dict,
+                    "env": {
+                        **env_config_dict["env"],
+                        "acs_train_w_ctrl": tune.grid_search([0.3, 0.5, 1.0]),
+                    },
+                },
+            },
             "framework": "torch",
             "callbacks": FlockingCallbacks,
             "model": {
                 "custom_model": model_name,
                 "custom_model_config": {
                     **custom_model_config,
-                    "scale_factor": tune.grid_search([0.07, 0.1, 0.15]),
+                    "scale_factor": 0.15,
                 },
             },
             # --- Resources (per trial) ---
@@ -148,9 +157,9 @@ if __name__ == "__main__":
             "train_batch_size": 16000,
             "sgd_minibatch_size": 256,
             "num_sgd_iter": 10,
-            # --- Learning rate ---
+            # --- Learning rate: decay from 5e-4 to 1e-4 over 50 iters ---
             "lr": 5e-4,
-            "lr_schedule": None,
+            "lr_schedule": [[0, 5e-4], [800000, 1e-4]],
             # --- PPO ---
             "vf_loss_coeff": 0.5,
             "use_critic": True,
@@ -158,11 +167,11 @@ if __name__ == "__main__":
             "gamma": 0.99,
             "lambda": 0.95,
             "kl_coeff": 0,
-            "clip_param": 0.2,
+            "clip_param": 0.15,
             "vf_clip_param": 256,
             "grad_clip": None,
             "kl_target": 0.01,
-            "entropy_coeff": 0,
+            "entropy_coeff": 0.005,
             # --- Evaluation (disabled) ---
             "evaluation_interval": None,
         },

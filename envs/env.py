@@ -1308,10 +1308,10 @@ class NeighborSelectionFlockingEnv(gym.Env):
             control_cost = rewards.sum() / self.num_agents
             control_cost = control_cost + (rho * self.config.env.dt)
 
-            # Connection cost: penalize fraction of selected edges
+            # Connection ratio: always compute for logging
             conn_cost = 0.0
             w_conn = self.config.env.acs_train_w_conn
-            if w_conn > 0 and hasattr(self, 'current_action'):
+            if hasattr(self, 'current_action'):
                 padding_mask = state["padding_mask"]
                 N = int(padding_mask.sum())
                 if N > 1:
@@ -1319,7 +1319,8 @@ class NeighborSelectionFlockingEnv(gym.Env):
                     num_edges = int(real_edges.sum()) - N
                     max_edges = N * (N - 1)
                     self._conn_ratio = num_edges / max_edges
-                    conn_cost = -self._conn_ratio
+                    if w_conn > 0:
+                        conn_cost = -self._conn_ratio
                 else:
                     self._conn_ratio = 0.0
 

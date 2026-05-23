@@ -104,8 +104,12 @@ Tested the gap between sf=0.05 (Phase 5) and sf=0.2 (Phase 5, collapse).
   - **Then collapsed at iter 32:** entropy crashed to 0 (fully deterministic), sp_ent spiked to 190. Same failure mode as sf=0.2, but delayed.
   - **Recovered at iter 40–49:** sp_ent returned to ~40, training vel_ent reached 0.06. But entropy=0 means the policy was fully deterministic — likely rediscovering FC (Phase 6 showed deterministic argmax policies behave as FC). **This is a training metric, not formal evaluation. No checkpoint at iter 49.**
   - **Second collapse at iter 63, partial recovery, then instability through iter 78.**
-- **Available checkpoints:** iter 50, 60, 70 (keep_checkpoints_num=3). Checkpoint 70 has training vel_ent=0.57, sp_ent=39.9, entropy=15.2. **None have been formally evaluated.**
-- **Key finding:** Sharp phase transition between sf=0.1 (no learning) and sf=0.15 (immediate learning + eventual collapse). sf=0.15 is ON the collapse boundary — same instability as sf=0.2, just delayed.
+- **Available checkpoints:** iter 50, 60, 70 (keep_checkpoints_num=3). Checkpoint 70 has training vel_ent=0.57, sp_ent=39.9, entropy=15.2.
+- **Checkpoint 70 formally evaluated (50 episodes, deterministic):**
+  - RL: reward=-258.4±89.7, vel_ent=0.15±0.71, sp_ent=39.6±1.4, flocking_success=0/50, **mean_edges/agent=19.0±0.0 (exactly FC)**
+  - FC-ACS: reward=-274.4±106.9, vel_ent=0.23±1.11, sp_ent=39.8±1.6, flocking_success=0/50, edges=19.0
+  - **Conclusion: policy converged to FC.** No selective neighbor selection. Marginal reward difference (+5.8%) is within noise.
+- **Key finding:** Sharp phase transition between sf=0.1 (no learning) and sf=0.15 (immediate learning + eventual collapse). sf=0.15 is ON the collapse boundary — same instability as sf=0.2, just delayed. All learned policies converge to FC regardless of training dynamics.
 
 ## Current State (2026-05-23)
 
@@ -113,19 +117,24 @@ Tested the gap between sf=0.05 (Phase 5) and sf=0.2 (Phase 5, collapse).
 None. All experiments stopped.
 
 ### Git state
-Branch `exp/autonomous-research`. Clean working tree.
+Branch `exp/autonomous-research`. Modified: `evaluate_checkpoint.py`, `train.py`, `envs/env.py`.
 
 ### Experiment results on disk
 All under `/workspace/test_results/`. Key ones:
 - `scale_factor_sweep_260521/` — sf {0.01, 0.05, 0.2}. Phase 5 data.
 - `sf03_fresh_lr2e4_260522/` — sf=0.03. Converged to near-FC (Phase 6).
 - `conn_cost_sweep_260522/` — Connection cost sweep. Zero learning (Phase 7a).
-- `sf_sweep_260522/` — sf {0.07, 0.1, 0.15}. sf=0.15 learned then collapsed (Phase 7b). **Checkpoints 50/60/70 available, NOT evaluated.**
+- `sf_sweep_260522/` — sf {0.07, 0.1, 0.15}. sf=0.15 learned then collapsed (Phase 7b). **Checkpoint 70 evaluated: exactly FC (19.0 edges/agent).**
+- `wctrl_sweep_260523/` — w_ctrl {0.3, 0.5, 1.0}. **Running.**
 
-### What has NOT been done
-- **No ego-centric checkpoint has been formally evaluated against FC-ACS.** `evaluate_checkpoint.py` only works with the centralized model. Need modification or a new script.
-- **No verification of whether any learned policy is genuinely selective (non-FC).** Phase 6 showed the only previously evaluated policy was near-FC.
-- **The sf=0.15 checkpoints (50/60/70) have not been evaluated at all.**
+### What has been done this session
+- **Modified `evaluate_checkpoint.py`** to support ego-centric model (`NeighborSelectionPPORLlib`). Auto-detects observation type from checkpoint params. Added mean_edges_per_agent and flocking_success metrics.
+- **Modified `envs/env.py`** to always compute `_conn_ratio` for logging, even when `w_conn=0`.
+- **Formally evaluated sf_sweep checkpoint 70** (50 episodes): exactly FC, 19.0 edges/agent, no selective behavior.
+- **Ran K-nearest diagnostic**: K=10 gets 23% less control cost than FC — confirmed selectivity IS beneficial.
+- **Ran 9 training experiments** testing w_ctrl sweep, entropy_coeff, sf values, batch sizes, lr schedules, fine-tuning from FC checkpoint, and curriculum approaches. All failed due to the bistability of the binary action space.
+- **Diagnosed the fundamental problem**: the independent binary action space with sf-scaled logits creates two strong attractors (FC and empty) with no stable intermediate. This is an architecture problem, not a reward problem.
+- **Identified clear next step**: Top-K action space to eliminate bistability.
 
 ## Autonomous Session Protocol (`/goal`)
 
@@ -162,17 +171,86 @@ The centralized model proved FC is suboptimal (verified with vel_ent < 1.0 conve
 
 ### Training dynamics lessons
 - `grad_clip` must be None. Default 1.0 kills actor learning.
-- `scale_factor`: sf ≤ 0.1 → no learning; sf=0.15 → learning but collapses by iter 32; sf=0.2 → immediate collapse. The narrow window (0.1–0.2) between "no learning" and "collapse" is the core training difficulty.
+- `scale_factor`: sf ≤ 0.12 → no learning (gradient too weak); sf=0.15 → learning but bistable; sf=0.2 → immediate collapse. The narrow window (0.12–0.2) is NOT tunable — it's a symptom of the binary action space architecture.
 - `aux_enabled=True` is necessary for learning.
 - `lr` ∈ [3e-4, 5e-4] is the productive range.
 - Connection cost (global sparsity penalty) does NOT work — per-edge gradient too diluted at 1/380.
+- `entropy_coeff` ≥ 0.005 kills learning for 380-edge binary action space (bonus 1.3/sample overwhelms policy gradient). entropy_coeff=0.001 is too weak to break FC. entropy_coeff=0.01 breaks FC but causes value function mismatch when later removed.
+- **w_ctrl > 0.02 with sf=0.15 DOES incentivize selectivity** — the policy immediately moves away from FC — but it overshoots to near-empty (conn<0.1) because the binary action space has no stable intermediate state.
+- **Higher w_ctrl with sf=0.05: alignment and control cost gradients partially cancel → zero learning.** The opposing reward components make the net per-edge gradient negligible at low sf.
 
-### Possible next approaches (prioritized)
-1. **Evaluate sf=0.15 checkpoint_000070** — Modify `evaluate_checkpoint.py` to load `NeighborSelectionPPORLlib` (ego-centric). Run deterministic eval, check action distribution. This determines whether the learned policy is FC or genuinely selective.
-2. **Stabilize sf=0.15 training** — Options:
-   - lr schedule: start at 5e-4, decay to 1e-4 after iter 20 (collapse happened at iter 32 with constant lr)
-   - entropy bonus (entropy_coeff=0.001) to prevent entropy from crashing to 0
-   - clip_param=0.1 (tighter PPO clipping to prevent overshoot)
-   - sf=0.12 or 0.13 (below collapse threshold but above no-learning threshold)
-3. **Top-K action space** — Replace independent binary per-edge with "select exactly K neighbors." Implementation: replace `attention_scores_to_logits()` + add Plackett-Luce custom action distribution. Forces non-FC by construction.
-4. **Higher w_ctrl (0.5–1.0)** — Make control cost savings from selective filtering visible in reward. Only useful if there IS a benefit to selective filtering (which eval of checkpoint 70 would reveal).
+### Phase 8: Formal eval of checkpoint 70 + w_ctrl sweep
+**Formal eval of sf_sweep checkpoint 70** (50 episodes, deterministic, `evaluate_checkpoint.py` modified to support ego-centric model):
+- RL: reward=-258.4±89.7, vel_ent=0.15±0.71, sp_ent=39.6±1.4, flocking_success=0/50, **edges/agent=19.0 (exactly FC)**
+- FC-ACS: reward=-274.4±106.9, vel_ent=0.23±1.11, sp_ent=39.8±1.6, flocking_success=0/50, edges=19.0
+- **Policy is FC.** No selective neighbor selection learned.
+
+**Diagnostic: FC vs sparse control cost** (10 episodes each, K-nearest heuristic):
+- FC (19 edges): return=-300.7±96, vel_ent=0.05, sp_ent=39.8
+- K=10: return=-231.7±56, vel_ent=0.23, sp_ent=61.3 — **23% less control cost than FC**
+- K=5: return=-248.2±32, vel_ent=3.44, sp_ent=297.7 — too sparse, swarm fragments
+- **Confirms selectivity IS beneficial** — the optimal edge count is well below FC.
+
+**`wctrl_sweep_260523`** (3 trials: w_ctrl ∈ {0.3, 0.5, 1.0}, sf=0.15, entropy_coeff=0.005, clip=0.15):
+- **All stuck at near-random (entropy≈263) after 4-8 iterations.** entropy_coeff=0.005 is too strong for 380 binary edges — the entropy bonus (0.005 × 263 = 1.3/sample) overwhelms the policy gradient.
+- **Killed after iter 8.** entropy_coeff must be ≤0.0001 for this action space, or 0.
+
+**`wctrl05_noent_260523`** (1 trial: w_ctrl=0.5, sf=0.15, entropy_coeff=0, clip=0.15):
+- Iter 1: entropy=211.6, conn=0.518, vel_ent=2.3 — **learning and selective!**
+- Iter 2-4: entropy collapsed to ~53, conn dropped to 0.20 (~4 edges/agent), vel_ent=10.0, reward=-1100.
+- **Same collapse as Phase 7b but in reverse direction** — instead of converging to FC, over-selected to near-empty. sf=0.15 gradient too aggressive.
+- **Killed after iter 4.**
+
+**`stable_wctrl_260523`** (2 trials: sf ∈ {0.10, 0.12}, w_ctrl=0.3, clip=0.1, lr=3e-4):
+- Both stuck at entropy=263 after 2 iterations. **Confirms: sf ≤ 0.12 = zero learning regardless of w_ctrl.** Killed.
+
+**`sf15_stable_260523`** (2 trials: w_ctrl ∈ {0.1, 0.2}, sf=0.15, clip=0.1, sgd_iter=5, lr=3e-4):
+- w_ctrl=0.1: entropy=263 at iter 2 — too little selectivity pressure. Dead.
+- w_ctrl=0.2: **Showed learning** (entropy oscillated 201→212→192→232 over 4 iters, conn oscillated 0.50→0.64→0.65→0.57). The stabilization prevented collapse, but gradient variance caused persistent oscillation. Killed at iter 4.
+
+**`sf15_bigbatch_260523`** (1 trial: sf=0.15, w_ctrl=0.2, batch=64k):
+- Entropy barely moved (263→262 over 4 iters). Conservative settings + large batch made learning too slow. Killed.
+
+**Fine-tune from FC checkpoint** (3 attempts with entropy_coeff ∈ {0, 0.01, 0.001}):
+- entropy_coeff=0: entropy stayed at 13.4 (vanishing gradient at FC — per-edge gradient ∝ p(1-p) ≈ 0.001). No learning.
+- entropy_coeff=0.01: entropy jumped 13→216 in 1 iter (broke out of FC!), but subsequent iter with entropy_coeff=0 immediately reverted to random (263) due to value function mismatch. The value function was calibrated to entropy-bonus rewards.
+- entropy_coeff=0.001: entropy barely moved (13→14). Push too weak.
+- **Conclusion: Two-phase fine-tune fails because the value function doesn't transfer across entropy_coeff changes.** Would need to re-train the value function gradually.
+
+**`sf05_wctrl02_260523`** (1 trial: sf=0.05, w_ctrl=0.2, Phase 5's settings):
+- Zero learning after 15 iterations (entropy=263.4, flat). With w_ctrl=0.2, the alignment and control cost gradients partially cancel → net gradient too weak for sf=0.05. Killed.
+
+**`sf15_longrun_260523`** (1 trial: sf=0.15, w_ctrl=0.2, clip=0.1, sgd_iter=5, lr_schedule 3e-4→5e-5, 20 iters):
+- Collapsed to over-sparse by iter 8: conn=0.073 (1.4 edges/agent), vel_ent=14 (terrible), reward=-782. Stabilized at conn≈0.065 for iters 9-20 but could not recover. **Same bistability as wctrl05_noent.**
+
+**`curriculum_step1_260523`** (fine-tune from checkpoint 70 with w_ctrl=0.05, entropy_coeff=0):
+- Stuck at FC (conn=0.994, entropy=13-14) for 5 iterations. **Vanishing gradient at FC attractor**: per-edge gradient ∝ p(1-p) ≈ 0.001 at p=0.999. Even increasing w_ctrl from 0.02→0.05 produces negligible per-edge signal.
+
+## Fundamental Diagnosis (Phase 8 conclusion)
+
+### The binary action space is bistable
+The independent binary per-edge action space with sf-scaled logits creates **two strong attractors**:
+1. **FC attractor** (all edges selected, entropy≈13): vanishing gradient because p≈0.999 → p(1-p)≈0.001
+2. **Empty attractor** (no edges selected, entropy≈90): vanishing gradient because p≈0.001 → p(1-p)≈0.001
+
+Any intermediate state is **unstable** — sf=0.15's gradient pushes each edge toward the nearest extreme. This creates the observed dynamics:
+- From random (entropy≈263): w_ctrl=0 → converges to FC; w_ctrl>0 → collapses to empty
+- From FC: gradient too small to drop any edge; entropy_coeff breaks out but jumps to random
+- Oscillation with conservative settings, but no convergence to a stable intermediate
+
+### Evidence this is an architecture problem, not a reward problem
+1. K=10 heuristic achieves 23% better return than FC — selectivity IS genuinely optimal
+2. w_ctrl=0.2 correctly incentivizes selectivity (verified: all w_ctrl>0 experiments moved away from FC)
+3. But the policy can only reach FC or empty, never the optimal intermediate (~10 edges/agent)
+
+### Recommended next approach: Top-K action space
+Replace the 380 independent binary decisions with "select exactly K neighbors per agent." This:
+1. **Forces non-FC by construction** (K < N-1)
+2. **Eliminates bistability** — no binary decision boundary per edge
+3. **Reduces action space** from 2^380 to C(19,K) per agent
+4. **Implementation path:**
+   - Replace `attention_scores_to_logits()` with top-K selection from raw attention scores
+   - Use Gumbel-softmax or Plackett-Luce for differentiable K-subset sampling
+   - K can be a hyperparameter (start with K=10 based on the diagnostic) or learned
+   - The encoder/decoder architecture stays the same — only the output layer changes
+5. **Alternative: continuous attention weights** — output weights in [0,1] for each edge, use weighted average in the ACS controller instead of binary mask. This keeps the existing architecture but requires env changes to support soft selection.
