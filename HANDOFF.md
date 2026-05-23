@@ -100,9 +100,14 @@ Tested the gap between sf=0.05 (Phase 5, delta=-44/100 iters) and sf=0.2 (Phase 
   - Iter 4–7: entropy rebounded to ~200 (PPO clipping regulating the initial overshoot), then stabilized. vel_ent oscillated but resumed improvement: 1.40→1.32→1.26→1.13
   - sp_ent stable at 39.7–39.9 throughout — no swarm disruption
   - **The oscillation damped by iter 8.** By iter 14: entropy=198.3 (steady decrease), vel_ent=1.23, sp_ent=39.4, reward=-107.4. The policy is in a stable learning regime.
-  - **sf=0.07 and sf=0.1:** Completely dead after 8 iterations. Entropy stuck at 263.3.
-- **Key finding:** There is a sharp PHASE TRANSITION between sf=0.1 (no learning at all) and sf=0.15 (immediate massive learning). The threshold determines whether the attention-score gradients are strong enough to escape the uniform attractor in a single PPO update.
-- **Status:** Still running (target 150 iters). vel_ent trending toward 1.0 but FC-ACS baseline is 0.10 — still a large gap. Need to evaluate checkpoint to determine if policy is approaching FC or discovering non-FC strategies.
+  - **sf=0.07 and sf=0.1:** Completely dead after 12 iterations. Entropy stuck at 263.3.
+  - **Collapse-recovery cycle (iter 32–78):** At iter 32, entropy jumped to 222 then crashed to 0 (fully deterministic). sp_ent spiked to 190 (swarm dispersed). But then the policy RECOVERED: by iter 46–49, vel_ent reached **0.06–0.09** — the **first ego-centric result below the FC-ACS threshold of 0.10.** This proves the ego-centric architecture CAN beat FC-ACS. However, the state is unstable — vel_ent oscillated back to 1.0+ before a second collapse-recovery cycle (iter 63–74) yielded vel_ent=0.44.
+  - **Available checkpoints:** iter 50 (vel_ent≈1.0), 60 (vel_ent≈1.2), 70 (vel_ent=0.57). Best: **checkpoint_000070** with vel_ent=0.57, sp_ent=39.9.
+- **Key findings:**
+  1. **Phase transition** between sf=0.1 (no learning) and sf=0.15 (immediate learning). The threshold determines whether attention-score gradients are strong enough to escape the uniform attractor.
+  2. **sf=0.15 is ON the collapse boundary.** It causes the same deterministic collapse as sf=0.2, just delayed to iter 32 instead of iter 1. The collapse isn't fatal — the policy can recover and achieve excellent results — but the trajectory is unstable.
+  3. **The ego-centric model CAN beat FC-ACS** (vel_ent=0.06 at iter 49). The challenge is stabilizing the training to consistently reach this state.
+- **Status:** Training stopped at iter 78 (instability). Checkpoints 50/60/70 saved. Need evaluation to determine if the good-vel_ent states are FC or non-FC.
 
 ### FC-ACS Baseline Performance
 Pure fully-connected deterministic ACS (10 episodes):
@@ -113,7 +118,9 @@ Pure fully-connected deterministic ACS (10 episodes):
 ## Current State (2026-05-22)
 
 ### Running experiments
-**`sf_sweep_260522`** — 3 trials (sf=0.07, 0.1, 0.15), 150 iters target. Running on GPUs 1 & 3 via `CUDA_VISIBLE_DEVICES=1,3 python train.py`. PID: check `ps aux | grep train.py`. Only sf=0.15 is learning. At iter 20: entropy=192.8 (still decreasing), vel_ent=1.22 (broke out of 1.3–1.4 plateau), sp_ent=39.7, reward=-116.1. The other two (sf=0.07, 0.1) are dead (entropy=263.3 after 12 iters). Checkpoints at iter 10 and 20 exist — **evaluate iter 20 checkpoint next session.**
+None. All experiments stopped.
+
+**`sf_sweep_260522`** completed (stopped at iter 78 due to instability). sf=0.15 showed collapse-recovery cycle: vel_ent reached 0.06 at iter 49 (below FC-ACS threshold) but oscillated. **Checkpoints 50/60/70 saved.** Best: checkpoint_000070 (vel_ent=0.57). sf=0.07/0.1 showed zero learning.
 
 ### Git state
 Branch `exp/autonomous-research`. Working tree has uncommitted changes: connection cost implementation in env.py, callbacks.py update, train.py for sf sweep, check_sweep.py utility.
@@ -166,11 +173,14 @@ The centralized-obs model proved that FC is suboptimal — a learned policy can 
 - **Higher w_ctrl alone doesn't help** — near the uniform initialization, FC and random-50% selections give similar average control costs.
 
 ### Possible next approaches
-- **sf=0.15 extended run:** The current sf_sweep is still running. If sf=0.15 continues to improve vel_ent (currently ~1.1, FC-ACS baseline is 0.10), let it run to 150 iterations and evaluate. **This is the highest-priority follow-up.**
-- **Evaluate sf=0.15 checkpoint:** Once iter 10+ is reached, evaluate with `evaluate_checkpoint.py` to determine whether the policy is approaching FC or learning non-FC strategies. Check action distribution (P(select) per edge, mean edges per agent).
-- **sf fine-tuning around 0.15:** Try sf=0.12, 0.13, 0.14 to find the exact onset of the phase transition. Lower sf might give slower but more stable learning without the initial oscillation.
-- **sf=0.15 + connection cost:** Now that sf=0.15 breaks the uniform attractor, adding w_conn might help SUSTAIN non-FC behavior rather than converging back to FC. The per-edge gradient from conn_cost should be non-diluted once the policy is no longer uniform.
-- **Action space redesign (top-K):** Investigation complete — top-K can be implemented by replacing only `attention_scores_to_logits()` and adding a custom Plackett-Luce action distribution, keeping the Transformer encoder unchanged. This would FORCE non-FC selection (each agent selects exactly K < N neighbors). Worth trying if sf=0.15 still converges to FC.
+- **Evaluate checkpoint_000070:** Use deterministic (argmax) actions. Check action distribution: is it near-FC or genuinely selective? Check mean edges per agent, per-edge probability distribution. **Highest priority — determines whether the good vel_ent states are trivially FC or novel.**
+- **Stabilize sf=0.15 training:** The collapse-recovery cycle shows the policy CAN achieve vel_ent=0.06, but the trajectory is unstable. Options:
+  - **Lower sf (0.12–0.13):** Slower learning but possibly avoids the deterministic collapse. The phase transition is sharp (sf=0.1 = no learning, sf=0.15 = learning + collapse), so the stable window may be narrow.
+  - **Reduce lr after initial learning (lr schedule):** Let sf=0.15 do the initial symmetry breaking, then lower lr (e.g., from 5e-4 to 1e-4 at iter 20) to stabilize. The collapse at iter 32 coincides with continued high lr on an already-non-uniform policy.
+  - **Increase clip_param** to 0.3–0.4 (let PPO make larger corrections after collapse) or **decrease it** to 0.1 (prevent the initial overshoot that triggers collapse).
+  - **Entropy coefficient +0.001** (small bonus) to prevent entropy from crashing to 0 (the collapse trigger).
+- **sf=0.15 + connection cost:** Now that sf=0.15 breaks the uniform attractor, adding w_conn might help SUSTAIN non-FC behavior. The conn_cost gradient is non-diluted once the policy is no longer uniform.
+- **Action space redesign (top-K):** Investigation complete — top-K can be implemented by replacing only `attention_scores_to_logits()` and adding a custom Plackett-Luce action distribution. This FORCES non-FC selection. Worth trying if checkpoint evaluation reveals all good states are trivially FC.
 - **Curriculum:** Start with fewer agents or shorter episodes, increase gradually.
 
 ### Evaluation protocol
