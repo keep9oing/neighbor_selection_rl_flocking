@@ -53,6 +53,7 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             #                                  by i to predict j's flock-center-frame state.
             #     "context"                  — use agent i's pooled context vector h_c_N[i] to predict
             #                                  i's own flock-center-frame state.
+            self.top_k = cfg["top_k"] if "top_k" in cfg else None
             self.aux_enabled = cfg["aux_enabled"] if "aux_enabled" in cfg else False
             self.aux_loss_coef = cfg["aux_loss_coef"] if "aux_loss_coef" in cfg else 0.1
             self.aux_loss_coef_critic = cfg["aux_loss_coef_critic"] if "aux_loss_coef_critic" in cfg else 0.0
@@ -267,8 +268,17 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
         scale_factor = self.scale_factor
         attention_scores *= scale_factor
 
-        # Self-loops: fill diag with large positive values
-        # attention_scores 에서 음수(incl masked vals) 일수록 안선택, 양수 일수록 선택
+        if self.top_k is not None and self.top_k < num_agents_max - 1:
+            diag_mask = torch.eye(num_agents_max, device=attention_scores.device).bool()
+            off_diag = attention_scores.masked_fill(diag_mask.unsqueeze(0), float('-inf'))
+            _, topk_idx = off_diag.topk(self.top_k, dim=-1)
+            topk_mask = torch.zeros_like(attention_scores, dtype=torch.bool)
+            topk_mask.scatter_(2, topk_idx, True)
+            topk_mask = topk_mask | diag_mask.unsqueeze(0)
+            # Bias top-K toward selection (+2 → P≈0.98 at init), block non-top-K
+            attention_scores = torch.where(topk_mask, attention_scores + 2.0,
+                                           torch.ones_like(attention_scores) * -1e9)
+
         large_val = 1e9
         attention_scores = attention_scores + torch.diag_embed(attention_scores.new_full((num_agents_max,), large_val))
 
