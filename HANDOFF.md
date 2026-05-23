@@ -101,12 +101,12 @@ Tested the gap between sf=0.05 (Phase 5, delta=-44/100 iters) and sf=0.2 (Phase 
   - sp_ent stable at 39.7–39.9 throughout — no swarm disruption
   - **The oscillation damped by iter 8.** By iter 14: entropy=198.3 (steady decrease), vel_ent=1.23, sp_ent=39.4, reward=-107.4. The policy is in a stable learning regime.
   - **sf=0.07 and sf=0.1:** Completely dead after 12 iterations. Entropy stuck at 263.3.
-  - **Collapse-recovery cycle (iter 32–78):** At iter 32, entropy jumped to 222 then crashed to 0 (fully deterministic). sp_ent spiked to 190 (swarm dispersed). But then the policy RECOVERED: by iter 46–49, vel_ent reached **0.06–0.09** — the **first ego-centric result below the FC-ACS threshold of 0.10.** This proves the ego-centric architecture CAN beat FC-ACS. However, the state is unstable — vel_ent oscillated back to 1.0+ before a second collapse-recovery cycle (iter 63–74) yielded vel_ent=0.44.
+  - **Collapse-recovery cycle (iter 32–78):** At iter 32, entropy jumped to 222 then crashed to 0 (fully deterministic). sp_ent spiked to 190 (swarm dispersed). The policy recovered: by iter 46–49, the training metric vel_ent reached 0.06–0.09. However, **this is NOT evidence of beating FC-ACS**: (a) it's a training episode mean, not formal evaluation; (b) the policy was fully deterministic (entropy=0), likely near-FC — Phase 6 showed argmax policies are effectively FC and FC itself achieves vel_ent=0.10; (c) no checkpoint exists at iter 49; (d) the state was transient (vel_ent bounced back to 1.0+ immediately). A second collapse-recovery cycle (iter 63–74) yielded vel_ent=0.44.
   - **Available checkpoints:** iter 50 (vel_ent≈1.0), 60 (vel_ent≈1.2), 70 (vel_ent=0.57). Best: **checkpoint_000070** with vel_ent=0.57, sp_ent=39.9.
 - **Key findings:**
   1. **Phase transition** between sf=0.1 (no learning) and sf=0.15 (immediate learning). The threshold determines whether attention-score gradients are strong enough to escape the uniform attractor.
   2. **sf=0.15 is ON the collapse boundary.** It causes the same deterministic collapse as sf=0.2, just delayed to iter 32 instead of iter 1. The collapse isn't fatal — the policy can recover and achieve excellent results — but the trajectory is unstable.
-  3. **The ego-centric model CAN beat FC-ACS** (vel_ent=0.06 at iter 49). The challenge is stabilizing the training to consistently reach this state.
+  3. **No evidence yet of beating FC-ACS.** The vel_ent=0.06 training metric at iter 49 is most likely the policy rediscovering FC (entropy=0, deterministic → argmax = FC). Formal checkpoint evaluation is needed to determine whether any saved state has learned genuinely selective (non-FC) behavior.
 - **Status:** Training stopped at iter 78 (instability). Checkpoints 50/60/70 saved. Need evaluation to determine if the good-vel_ent states are FC or non-FC.
 
 ### FC-ACS Baseline Performance
