@@ -2,7 +2,7 @@
 
 ## Research Goal
 
-Train an ego-centric PPO policy that, given each agent's local observation, selects **which neighbors to listen to** (binary adjacency matrix per step). The low-level ACS controller then uses the selected subgraph to compute velocity updates.
+Train an ego-centric RL policy that, given each agent's local observation, selects **which neighbors to listen to** (binary adjacency matrix per step). The low-level ACS controller then uses the selected subgraph to compute velocity updates.
 
 **Success metric:** The ego-centric policy must **clearly outperform the fully-connected ACS baseline** — faster convergence to flocking and/or better eval reward. The centralized-obs model already achieved this under a **relaxed convergence condition (vel_ent < 1.0 instead of the default 0.1)**: it converges faster and achieves better eval reward than FC-ACS. The ego-centric model should target the same. Under FC, ego-centric and centralized observations are mathematically interconvertible, so a parameter-sharing ego-centric policy can in principle replicate the centralized policy's decisions.
 
