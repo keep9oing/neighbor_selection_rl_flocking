@@ -138,10 +138,11 @@ This document drives autonomous `/goal` sessions. Each session reads HANDOFF.md,
 
 ### Operating rules
 1. **Read HANDOFF.md first** — understand current state, what's been tried, what's next.
-2. **Delegate to sub-agents (Opus)** for code exploration and experiment monitoring. Main agent makes research decisions and records findings.
-3. **Evaluate before claiming results.** Training metrics (episode_reward_mean, custom_metrics) are noisy indicators. Only formal multi-episode evaluation with deterministic actions counts as evidence.
-4. **Resources** — GPUs: `cuda:1` and `cuda:3` only. CPU: max 58 Ray workers total.
-5. **Git workflow** — work on branch `exp/autonomous-research`. Commit freely (local only, never push).
+2. **Delegate to sub-agents (Opus)** — all code exploration, experiment config generation, evaluation runs, and training monitoring go to sub-agents. All sub-agents must use model=opus. Main agent makes research decisions and records findings only.
+3. **Training monitoring** — do NOT poll iteration progress from the main agent. Instead, launch a sub-agent with `run_in_background=true` to monitor and report back when a target iteration is reached. Estimate iteration time from prior data (sf=0.15 with 3 trials: ~6 min/iter) and check at reasonable intervals (e.g., if 30 iters will take ~3 hours, check at 2.5h and 3h — not every 30 seconds).
+4. **Evaluate before claiming results.** Training metrics (episode_reward_mean, custom_metrics) are noisy indicators. Only formal multi-episode evaluation with deterministic actions counts as evidence. Never write "proves" or "CAN beat" in HANDOFF without eval data.
+5. **Resources** — GPUs: `cuda:1` and `cuda:3` only. CPU: max 58 Ray workers total.
+6. **Git workflow** — work on branch `exp/autonomous-research`. Commit freely (local only, never push).
 6. **Record accurately** — update Research Trajectory with factual findings. Do not overstate results. Distinguish training metrics from formal evaluation.
 7. **Graceful exit** — update this file so the next session can continue seamlessly.
 
