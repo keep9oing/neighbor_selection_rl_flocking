@@ -4,7 +4,7 @@
 
 Train an ego-centric PPO policy that, given each agent's local observation, selects **which neighbors to listen to** (binary adjacency matrix per step). The low-level ACS controller then uses the selected subgraph to compute velocity updates.
 
-**Success metric:** The ego-centric policy must **clearly outperform the fully-connected ACS baseline** on flocking quality (velocity/spatial entropy, flocking success rate). Merely matching or approximating FC is considered failure — the policy must learn meaningful neighbor discrimination. This is known to be achievable: the centralized-obs model already demonstrated performance far exceeding FC-ACS. Under FC, ego-centric and centralized observations (flock-center + average-heading frame) are mathematically interconvertible, so a parameter-sharing ego-centric policy can in principle replicate the centralized policy's decisions. The auxiliary task (predicting centralized-frame states from ego encoder embeddings) was motivated by this interconvertibility, but proved insufficient on its own.
+**Success metric:** The ego-centric policy must **clearly outperform the fully-connected ACS baseline** — faster convergence to flocking and/or better eval reward. The centralized-obs model already achieved this under a **relaxed convergence condition (vel_ent < 1.0 instead of the default 0.1)**: it converges faster and achieves better eval reward than FC-ACS. The ego-centric model should target the same. Under FC, ego-centric and centralized observations are mathematically interconvertible, so a parameter-sharing ego-centric policy can in principle replicate the centralized policy's decisions.
 
 **Current status: FC-ACS has NOT been beaten.** No ego-centric checkpoint has been formally evaluated as outperforming FC-ACS. All trained policies so far either (a) converged to near-FC, or (b) became unstable before being evaluated.
 
@@ -156,9 +156,9 @@ Every trained ego-centric policy has either:
 The question is whether FC is the true optimum under the current reward, or whether the training dynamics prevent discovering better strategies.
 
 ### Why FC might be suboptimal
-1. **Control cost:** With FC, each agent averages ALL neighbors. A selective policy could reduce unnecessary turning → lower control cost. But with w_ctrl=0.02 this benefit is negligible.
-2. **Communication constraints:** Adding `comm_range` limits would force selection.
-3. **Agent scaling:** With 50+ agents, FC becomes impractical.
+The centralized model proved FC is suboptimal (verified with vel_ent < 1.0 convergence criterion — faster convergence and better eval reward than FC-ACS). Possible reasons:
+1. **Control cost:** With FC, each agent averages ALL neighbors including distant/misaligned ones → unnecessary turning. Selective filtering reduces this. But with w_ctrl=0.02, this benefit is negligible in training reward.
+2. **Convergence speed:** A selective policy that ignores noisy/distant neighbors may converge to alignment faster than FC, which dilutes signal with noise from all 19 neighbors.
 
 ### Training dynamics lessons
 - `grad_clip` must be None. Default 1.0 kills actor learning.
