@@ -168,6 +168,8 @@ class NeighborSelectionFlockingEnv(gym.Env):
         self.has_lost_comm = None
         self.lost_comm_step = None
         self.time_step = None
+        self._cached_first_action = None
+        self._last_neighbor_index_diagnostics = None
         # self.agent_time_step = None
         # Vicsek hist
         self.alignment_hist = None
@@ -184,8 +186,14 @@ class NeighborSelectionFlockingEnv(gym.Env):
                 self.action_dtype = np.int8
                 self.action_space = Box(low=0, high=1,
                                         shape=(self.num_agents_max, self.num_agents_max), dtype=self.action_dtype)
+            elif self.config.env.action_type == "neighbor_index":
+                # Each agent picks ONE neighbor index (self allowed) at episode start; that distance becomes
+                # the threshold for which neighbors are used in flocking control. Action is cached on first step
+                # of an episode and reused for the remainder of the episode.
+                self.action_dtype = np.int64
+                self.action_space = MultiDiscrete([self.num_agents_max] * self.num_agents_max)
             else:
-                raise NotImplementedError("action_type must be binary_vector. "
+                raise NotImplementedError("action_type must be binary_vector or neighbor_index. "
                                           "The radius and continuous_vector are still in alpha, sorry.")
         elif self.config.env.env_mode == "multi_env":
             print("WARNING (env.__init__): multi_env is experimental; not fully implemented yet")
@@ -323,6 +331,9 @@ class NeighborSelectionFlockingEnv(gym.Env):
         self.reset()
         # Init time steps
         self.time_step = 0
+        # Reset cached action for neighbor_index action_type (reset() already does this, but be explicit)
+        self._cached_first_action = None
+        self._last_neighbor_index_diagnostics = None
         # self.agent_time_step = np.zeros(self.num_agents_max, dtype=np.int32)
 
         # Get initial num_agents
@@ -374,6 +385,10 @@ class NeighborSelectionFlockingEnv(gym.Env):
         # Init time steps
         self.time_step = 0
         # self.agent_time_step = np.zeros(self.num_agents_max, dtype=np.int32)
+
+        # Reset cached action for neighbor_index action_type (set on first step of episode and frozen thereafter)
+        self._cached_first_action = None
+        self._last_neighbor_index_diagnostics = None
 
         # Get initial num_agents
         self.num_agents = self.np_random.choice(self.num_agents_pool_np)  # randomly choose the num_agents
@@ -429,6 +444,13 @@ class NeighborSelectionFlockingEnv(gym.Env):
         state = self.state  # state of the class (flock);
         rel_state = self.rel_state  # did NOT consider the communication network, DELIBERATELY
 
+        # Action persistence for neighbor_index: cache the action from the first step of the episode and reuse it.
+        # Subsequent step() calls still receive new actions from the policy, but they are discarded.
+        if self.config.env.action_type == "neighbor_index":
+            if self._cached_first_action is None:
+                self._cached_first_action = np.asarray(action, dtype=np.int64).copy()
+            action = self._cached_first_action
+
         # Interpret the action (i.e. model output)
         action_interpreted = self.interpret_action(model_output=action)
         joint_action = self.multi_to_single(action_interpreted) if self.config.env.env_mode == "multi_env" \
@@ -464,6 +486,14 @@ class NeighborSelectionFlockingEnv(gym.Env):
             "original_reward": _reward,
             "comm_loss_agents": comm_loss_agents,
         }
+        if self.config.env.action_type == "neighbor_index" and self._last_neighbor_index_diagnostics is not None:
+            info.update({
+                "anchor_distance_mean": self._last_neighbor_index_diagnostics["anchor_distance_mean"],
+                "anchor_distance_min": self._last_neighbor_index_diagnostics["anchor_distance_min"],
+                "anchor_distance_max": self._last_neighbor_index_diagnostics["anchor_distance_max"],
+                "selected_neighbor_count_mean": self._last_neighbor_index_diagnostics["selected_neighbor_count_mean"],
+                "self_chosen_ratio": self._last_neighbor_index_diagnostics["self_chosen_ratio"],
+            })
         info = self.get_extra_info(info, next_state, next_rel_state, control_inputs, rewards, done)
         if self.config.env.get_state_hist:
             self.agent_states_hist[self.time_step] = next_state["agent_states"]
@@ -545,6 +575,16 @@ class NeighborSelectionFlockingEnv(gym.Env):
             assert np.issubdtype(action.dtype, np.integer), "action must be a numpy integer type"
             assert action.shape == (self.num_agents_max, self.num_agents_max), \
                 "action must be a ndarray of shape (num_agents_max, num_agents_max)"
+        elif self.config.env.action_type == "neighbor_index":
+            # After to_binary_action, `action` is already an (N, N) int8 binary network. Check it here too.
+            assert isinstance(action, np.ndarray), "action must be a numpy ndarray"
+            assert np.issubdtype(action.dtype, np.integer), "action must be a numpy integer type"
+            assert action.shape == (self.num_agents_max, self.num_agents_max), \
+                "action must be a ndarray of shape (num_agents_max, num_agents_max) after to_binary_action"
+            # The cached anchor indices should not point to padding agents (would be invalid).
+            if self._cached_first_action is not None:
+                assert np.all(padding_mask[self._cached_first_action[padding_mask]]), \
+                    "neighbor_index anchor indices must point to non-padding agents"
 
         # Ensure the diagonal elements are all ones (all with self-loops); if not, set them to ones
         if not np.all(np.diag(action) == 1):
@@ -576,6 +616,45 @@ class NeighborSelectionFlockingEnv(gym.Env):
     def to_binary_action(self, action_in_another_type):
         if self.config.env.action_type == "binary_vector":
             return action_in_another_type
+        elif self.config.env.action_type == "neighbor_index":
+            # action_in_another_type: ndarray of shape (num_agents_max,), each entry is an int neighbor index in [0, N-1]
+            # Semantics: agent i picks an anchor j_i (self allowed). Threshold = dist(i, j_i).
+            # Selected neighbors: { k : dist(i, k) <= dist(i, j_i) } intersected with neighbor_masks and padding mask.
+            # If j_i == i (self), threshold = 0 -> no other neighbors selected; self-loop only.
+            anchor_idx = np.asarray(action_in_another_type, dtype=np.int64)
+            assert anchor_idx.shape == (self.num_agents_max,), \
+                "neighbor_index action must be a ndarray of shape (num_agents_max,)"
+
+            padding_mask = self.state["padding_mask"]  # (N,)
+            padding_mask_2d = padding_mask[:, np.newaxis] & padding_mask[np.newaxis, :]
+
+            rel_state = self.get_relative_state(state=self.state)
+            rel_agent_dists = rel_state["rel_agent_dists"]  # (N, N), 0 on diagonal
+
+            row_idx = np.arange(self.num_agents_max)
+            thresholds = rel_agent_dists[row_idx, anchor_idx]  # (N,)
+            dist_mask = rel_agent_dists <= thresholds[:, np.newaxis]  # (N, N), <= per user spec (tie included)
+            selected_network = self.state["neighbor_masks"] & dist_mask & padding_mask_2d  # (N, N) bool
+
+            active_agents_indices = np.nonzero(padding_mask)[0]
+            selected_network[active_agents_indices, active_agents_indices] = True  # force self-loops
+
+            # Diagnostics over active agents only
+            active_mask = padding_mask
+            active_anchor_idx = anchor_idx[active_mask]
+            active_thresholds = thresholds[active_mask]
+            selected_counts = selected_network[active_mask].sum(axis=1)
+            self_chosen = (active_anchor_idx == np.nonzero(active_mask)[0])
+            self._last_neighbor_index_diagnostics = {
+                "anchor_idx": anchor_idx.copy(),
+                "anchor_distance_mean": float(active_thresholds.mean()),
+                "anchor_distance_min": float(active_thresholds.min()),
+                "anchor_distance_max": float(active_thresholds.max()),
+                "selected_neighbor_count_mean": float(selected_counts.mean()),
+                "self_chosen_ratio": float(self_chosen.mean()),
+            }
+
+            return selected_network.astype(np.int8)
         elif self.config.env.action_type == "radius":
             # action_in_another_type: ndarray of shape (num_agents_max, )
             # # action_in_another_type[i] is the radius of the communication range of agent i

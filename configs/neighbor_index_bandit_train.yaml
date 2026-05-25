@@ -1,0 +1,119 @@
+run:
+  name: neighbor_index_bandit_20agents
+  local_dir: ./ray_results
+  env_name: neighbor_index_bandit_env
+  model_name: neighbor_index_rl
+  checkpoint_freq: 8
+  keep_checkpoints_num: 16
+  checkpoint_at_end: true
+  checkpoint_score_attr: episode_reward_mean
+  checkpoint_score_order: max
+  seed_id: 42
+  num_cpus: 8
+  num_gpus: 0.5
+  inner_gamma: 1.0   # undiscounted cumulative inner return as the bandit reward
+
+env:
+  is_training: true
+  action_type: neighbor_index
+  env_mode: single_env
+  observation_type: ego_centric
+  use_rotated_ego_obs: true
+  agent_name_prefix: agent_
+  task_type: acs
+  num_agents_pool: [20]
+  obs_dim: 4
+  comm_range: null
+  max_time_steps: 1000
+  use_fixed_episode_length: true
+  get_action_hist: false
+  get_state_hist: false
+  ignore_comm_lost_agents: false
+  periodic_boundary: false
+  acs_train_w_ctrl: 0.02
+  acs_train_w_pos: 1.0
+  acs_train_w_vel: 0.2
+  alignment_goal: 0.97
+  alignment_rate_goal: 0.03
+  alignment_window_length: 32
+  entropy_p_goal: null
+  entropy_p_rate_goal: 0.1
+  entropy_rate_window_length: 50
+  entropy_v_goal: 0.1
+  entropy_v_rate_goal: 0.2
+
+control:
+  beta: 0.3333333333333333
+  initial_position_bound: 250.0
+  k1: 1.0
+  k2: 3.0
+  lam: 5.0
+  max_turn_rate: 0.5333333333333333
+  r0: 60.0
+  rho: 1.0
+  sig: 1.0
+  speed: 15.0
+
+model:
+  d_embed_context: 128
+  d_embed_input: 128
+  d_ff: 256
+  d_ff_decoder: 256
+  d_model: 128
+  d_model_decoder: 128
+  d_subobs: 4
+  dr_rate: 0
+  is_bias: false
+  n_layers_decoder: 1
+  n_layers_encoder: 3
+  norm_eps: 1.0e-5
+  num_heads: 4
+  scale_factor: 1.0
+  share_layers: false
+  use_FNN_in_decoder: true
+  use_residual_in_decoder: true
+
+# PPO hyperparameters. Note: with the bandit framing each "transition" is one full inner
+# episode, so train_batch_size / rollout_fragment_length are in EPISODE units.
+ppo:
+  framework: torch
+  num_workers: 16
+  num_envs_per_worker: 1
+  rollout_fragment_length: 8
+  train_batch_size: 128
+  sgd_minibatch_size: 32
+  num_sgd_iter: 10
+  lr: 1.0e-4
+  lr_schedule:
+    - [0, 1.0e-4]
+    - [1000000, 1.0e-6]
+  vf_loss_coeff: 0.5
+  use_critic: true
+  use_gae: true
+  gamma: 0.99           # 1-step outer episode -> gamma is effectively no-op
+  lambda: 0.95
+  kl_coeff: 0
+  clip_param: 0.2
+  vf_clip_param: 1024
+  grad_clip: 0.5
+  kl_target: 0.01
+  entropy_coeff: 0.01
+
+# stop: { training_iteration: 500 }   # uncomment to bound the run length
+
+# Override block applied only with --smoke. Keeps the rest of the config intact.
+smoke:
+  run:
+    name: neighbor_index_bandit_smoke
+    num_gpus: 0
+  env:
+    num_agents_pool: [6]
+    max_time_steps: 30
+  ppo:
+    num_workers: 0
+    rollout_fragment_length: 4
+    train_batch_size: 8
+    sgd_minibatch_size: 4
+    num_sgd_iter: 2
+  stop:
+    training_iteration: 1

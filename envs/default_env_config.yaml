@@ -12,3 +12,8 @@ control:
 
 env:
     num_agents_pool: [20]  # Must be specified
+    # action_type options:
+    #   "binary_vector"  - per-step (N,N) binary adjacency over all neighbors (default)
+    #   "neighbor_index" - per-agent ONE neighbor index (self allowed); applied only at step 0 and frozen
+    #                      for the rest of the episode. Selected neighbors = those with dist <= dist(i, anchor_i).
+    # action_type: binary_vector
