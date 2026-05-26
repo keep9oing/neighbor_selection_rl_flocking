@@ -6,7 +6,7 @@ Train an ego-centric RL policy that, given each agent's local observation, selec
 
 **Success metric:** The ego-centric policy must **clearly outperform the fully-connected ACS baseline** — faster convergence to flocking and/or better eval reward. The centralized-obs model already achieved this under a **relaxed convergence condition (vel_ent < 1.0 instead of the default 0.1)**: it converges faster and achieves better eval reward than FC-ACS. The ego-centric model should target the same. Under FC, ego-centric and centralized observations are mathematically interconvertible, so a parameter-sharing ego-centric policy can in principle replicate the centralized policy's decisions.
 
-**Current status: FC-ACS HAS BEEN BEATEN.** The `rankbias_s05_260526` checkpoint 5 achieves reward=-227.2 vs FC's -272.2 (paired t=4.54, p<0.001, 100 episodes). The policy selects 10 nearest neighbors via rank-based distance bias with RL-learned corrections.
+**Current status: FC-ACS has NOT been beaten by RL.** K=10 nearest heuristic beats FC by 17% (t=4.94), confirming selective IS better. But no RL-trained ego-centric policy has matched KNN performance. The binary action space + scalar reward architecture prevents RL from learning per-edge credit assignment.
 
 **Evaluation metrics** (logged by callbacks):
 - **Episode reward** — primary metric. Sum of per-agent ACS rewards (`env._compute_rewards()`): negative heading-rate control cost + cruise cost. Must clearly exceed FC-ACS baseline.
@@ -116,12 +116,8 @@ Tested the gap between sf=0.05 (Phase 5) and sf=0.2 (Phase 5, collapse).
 ### Running experiments
 None.
 
-### **FC-ACS HAS BEEN BEATEN** (2026-05-26)
-**Checkpoint:** `rankbias_s05_260526` checkpoint 5 — ego-centric model with rank-based distance bias.
-- **Paired t-test (100 episodes): reward -227.2 vs FC -272.2, diff=+45.0, t=4.54, p<0.001**
-- **RL wins 67/100 episodes**, using 10 edges/agent (47% fewer than FC)
-- 16.5% less total control cost than FC-ACS
-- The model uses a rank-based distance bias (`distance_bias_scale=0.5`, `top_k=10`) that encodes proximity as architectural inductive bias. With sf=0.05 and 5 PPO iterations, the learned attention scores provide small corrections on top of the K-nearest base.
+### FC-ACS has NOT been beaten by RL
+**K=10 nearest heuristic beats FC** (paired t=4.94, p<0.001, reward -225 vs -272, 17% better). But no RL-trained policy has matched or exceeded KNN performance. The rank-biased checkpoint was equivalent to KNN with RL-added noise (RL made it 2.2 points worse). BC+RL fine-tuning collapsed immediately (sf=0.15 destroys BC initialization by iter 2).
 
 ### Git state
 Branch `exp/autonomous-research`. Modified: `evaluate_checkpoint.py`, `train.py`, `envs/env.py`.
@@ -271,9 +267,39 @@ The top-K constraint successfully eliminates the FC/empty bistability, but the m
 2. **Random selection within top-K is a strong baseline**: by chance, random top-K includes enough useful neighbors for reasonable alignment (vel_ent=3.8). The trained policy's confident-but-wrong selections are worse.
 3. **Entropy collapse to 0 prevents recovery**: once the policy becomes deterministic about a bad selection, it can't explore better options.
 
+### Phase 10: Distance bias + BC+RL (2026-05-26)
+
+**Rank-biased model (disguised heuristic — user correctly identified):**
+- rank bias scale=5: entropy=0, pure KNN, RL contributes nothing
+- rank bias scale=0.5: entropy=1.9, near-pure KNN, RL degrades by 2.2 points vs KNN
+- KNN heuristic (t=4.94) > RL checkpoint (t=4.54) > FC — RL made KNN WORSE
+
+**Distance-based bias (absolute, threshold=1.4):**
+- scale=1.0, sf=0.05: stable training, vel_ent improving, but policy converged toward FC (conn 0.90→0.94). Eval at iter 80: FC still wins (paired t-test).
+- scale=3.0, sf=0.05: conn=0.999 (FC) because agents cluster mid-episode → all distances shrink below threshold.
+- scale=10, sf=0.15: same clustering issue, plus instability.
+
+**Rank-based bias (scale-invariant — the fix for clustering):**
+- Maintains K=10 nearest regardless of spatial clustering. Verified: 10 edges/agent at both episode start and after 200 steps.
+- But: scale≥2 → entropy=0 (pure KNN, no RL learning). Scale=0.5 → RL degrades KNN.
+
+**BC + RL fine-tuning:**
+- Phase 1 (BC): 99.4% accuracy, 96% action match with KNN. Model genuinely learns distance-based selection from weights.
+- Phase 2 (RL, sf=0.15): BC initialization destroyed by iter 2 (conn 0.531→0.411→collapse to 0.123 by iter 10). Same bistability.
+
+**Core conclusion:** The per-edge credit assignment problem is structural, not fixable by initialization, biases, or hyperparameter tuning. 380 independent binary decisions with one scalar reward → PPO's gradient is noise that degrades any good policy.
+
 ### Recommended next approaches (prioritized)
-1. **Initialize top-K from K-nearest heuristic** — start with a good selection (vel_ent=0.23) and fine-tune. The model would learn to IMPROVE on K-nearest, not discover it from scratch. Implementation: add distance-based initialization bias to attention scores.
-2. **Stronger anti-collapse bias (+5.0 or higher)** — prevents the model from overcoming the selection bias, keeping conn stable longer. Combined with lower lr (1e-4) for slower, more stable learning.
-3. **Per-agent reward shaping** — instead of one scalar reward, give each agent a separate reward signal based on its individual alignment improvement. This provides clearer credit assignment.
-4. **Continuous attention weights** — replace binary select/don't-select with continuous weights in [0,1]. The ACS controller uses weighted averages instead of binary masks. This gives smooth gradients everywhere. Requires env modification.
-5. **Longer training with exploration** — use entropy_coeff=0.001 (scales correctly for 19.1-nat max entropy with top-K) to maintain exploration, prevent entropy collapse, and train for 200+ iterations.
+
+**The blocker is credit assignment, not architecture.** All attempts with independent binary edges + scalar reward failed because PPO can't attribute the episode reward to individual edge decisions. Solutions must address this directly.
+
+1. **Per-agent reward decomposition** — compute per-agent rewards in `compute_custom_reward()` (each agent's control cost + alignment contribution separately). Sum for the env scalar, but use per-agent values in a **custom PPO loss** (similar to the existing aux task hook). Each agent's 19 edge decisions share only that agent's advantage — 19× better credit assignment than sharing across 380 edges.
+2. **Continuous attention weights** — replace binary 0/1 with continuous [0,1] weights. The ACS controller uses `weight[i,j] * neighbor_j_heading` instead of `action[i,j] * neighbor_j_heading`. Smooth gradients everywhere; no bistability. Requires `env_transition()` modification (~20 lines).
+3. **Autoregressive neighbor selection** — select neighbors one at a time per agent, conditioning on previous selections. Use a Plackett-Luce distribution over the pointer-net scores. Each selection gets its own reward attribution. Requires custom action distribution + env wrapper.
+4. **Multi-agent RL** — treat each agent as a separate agent in RLlib's multi-agent mode. Per-agent obs, per-agent reward, per-agent policy. The action per agent is a 19-dim binary vector — much smaller than 380. The env already supports `multi_env` mode.
+
+**What's been ruled out:**
+- Architectural biases (distance, rank, top-K): all reduce to hardcoded heuristics. RL either contributes nothing or degrades.
+- BC + RL fine-tuning: sf=0.15 destroys any initialization in 1-2 iters. Lower sf → no learning.
+- Reward weight tuning (w_ctrl, w_vel, w_pos): doesn't address the credit assignment gap.
+- Hyperparameter tuning (lr, clip, batch size, entropy_coeff): exhaustively explored. No combination stabilizes the binary action space.

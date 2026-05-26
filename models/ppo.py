@@ -1,5 +1,6 @@
 # Everything is copy
 import copy
+import os
 # Please let me get out of ray rllib
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 from ray.rllib.utils.typing import ModelConfigDict, TensorType
@@ -55,6 +56,7 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             #                                  i's own flock-center-frame state.
             self.top_k = cfg["top_k"] if "top_k" in cfg else None
             self.distance_bias_scale = cfg["distance_bias_scale"] if "distance_bias_scale" in cfg else 0.0
+            self._pretrained_weights_path = cfg.get("pretrained_weights_path", None)
             self.aux_enabled = cfg["aux_enabled"] if "aux_enabled" in cfg else False
             self.aux_loss_coef = cfg["aux_loss_coef"] if "aux_loss_coef" in cfg else 0.1
             self.aux_loss_coef_critic = cfg["aux_loss_coef_critic"] if "aux_loss_coef_critic" in cfg else 0.0
@@ -211,6 +213,12 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
         self._aux_neighbor_masks = None   # (B, N, N), float
         self._last_aux_loss = None        # scalar for actor aux
         self._last_aux_loss_critic = None # scalar for critic aux
+
+        if self._pretrained_weights_path and os.path.exists(self._pretrained_weights_path):
+            state = torch.load(self._pretrained_weights_path, map_location="cpu")
+            self.load_state_dict(state, strict=False)
+            print(f"Loaded pretrained weights from {self._pretrained_weights_path}")
+            self._pretrained_weights_path = None
 
     def forward(
         self,
