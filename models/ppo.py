@@ -54,6 +54,7 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             #     "context"                  — use agent i's pooled context vector h_c_N[i] to predict
             #                                  i's own flock-center-frame state.
             self.top_k = cfg["top_k"] if "top_k" in cfg else None
+            self.distance_bias_scale = cfg["distance_bias_scale"] if "distance_bias_scale" in cfg else 0.0
             self.aux_enabled = cfg["aux_enabled"] if "aux_enabled" in cfg else False
             self.aux_loss_coef = cfg["aux_loss_coef"] if "aux_loss_coef" in cfg else 0.1
             self.aux_loss_coef_critic = cfg["aux_loss_coef_critic"] if "aux_loss_coef_critic" in cfg else 0.0
@@ -225,6 +226,18 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
         # per_agent_h_c_N:      (batch_size, num_agents_max, d_embed_context) - for context aux branch
         # per_pair_encoder_out: (batch_size, N_i, N_j, d_embed_input) - for pair_embedding aux branch
         att, h_c_N, per_agent_h_c_N, per_pair_encoder_out = self.actor(obs_dict)
+
+        if self.distance_bias_scale > 0:
+            local_obs = obs_dict["local_agent_infos"]  # (B, N, N, obs_dim)
+            rel_pos = local_obs[:, :, :, :2]  # (B, N, N, 2)
+            dist_sq = (rel_pos ** 2).sum(dim=-1)  # (B, N, N)
+            N = dist_sq.shape[-1]
+            K = min(self.top_k or 10, N - 1)
+            diag_inf = torch.eye(N, device=dist_sq.device).unsqueeze(0) * 1e9
+            dist_sq_nodiag = dist_sq + diag_inf
+            ranks = dist_sq_nodiag.argsort(dim=-1).argsort(dim=-1).float()
+            self._distance_bias = self.distance_bias_scale * (K - 0.5 - ranks)
+
         x = self.attention_scores_to_logits(att)  # (batch_size, num_agents_max * num_agents_max * 2)
 
         if self.share_layers:
@@ -267,6 +280,9 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
         # Warning: this also scales the masked values from the MHA layer (1e9 * scale_factor > 1e2)
         scale_factor = self.scale_factor
         attention_scores *= scale_factor
+
+        if self.distance_bias_scale > 0 and hasattr(self, '_distance_bias'):
+            attention_scores = attention_scores + self._distance_bias
 
         if self.top_k is not None and self.top_k < num_agents_max - 1:
             diag_mask = torch.eye(num_agents_max, device=attention_scores.device).bool()

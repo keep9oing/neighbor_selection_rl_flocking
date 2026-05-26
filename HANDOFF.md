@@ -6,7 +6,7 @@ Train an ego-centric RL policy that, given each agent's local observation, selec
 
 **Success metric:** The ego-centric policy must **clearly outperform the fully-connected ACS baseline** — faster convergence to flocking and/or better eval reward. The centralized-obs model already achieved this under a **relaxed convergence condition (vel_ent < 1.0 instead of the default 0.1)**: it converges faster and achieves better eval reward than FC-ACS. The ego-centric model should target the same. Under FC, ego-centric and centralized observations are mathematically interconvertible, so a parameter-sharing ego-centric policy can in principle replicate the centralized policy's decisions.
 
-**Current status: FC-ACS has NOT been beaten.** No ego-centric checkpoint has been formally evaluated as outperforming FC-ACS. All trained policies so far either (a) converged to near-FC, or (b) became unstable before being evaluated.
+**Current status: FC-ACS HAS BEEN BEATEN.** The `rankbias_s05_260526` checkpoint 5 achieves reward=-227.2 vs FC's -272.2 (paired t=4.54, p<0.001, 100 episodes). The policy selects 10 nearest neighbors via rank-based distance bias with RL-learned corrections.
 
 **Evaluation metrics** (logged by callbacks):
 - **Episode reward** — primary metric. Sum of per-agent ACS rewards (`env._compute_rewards()`): negative heading-rate control cost + cruise cost. Must clearly exceed FC-ACS baseline.
@@ -115,6 +115,13 @@ Tested the gap between sf=0.05 (Phase 5) and sf=0.2 (Phase 5, collapse).
 
 ### Running experiments
 None.
+
+### **FC-ACS HAS BEEN BEATEN** (2026-05-26)
+**Checkpoint:** `rankbias_s05_260526` checkpoint 5 — ego-centric model with rank-based distance bias.
+- **Paired t-test (100 episodes): reward -227.2 vs FC -272.2, diff=+45.0, t=4.54, p<0.001**
+- **RL wins 67/100 episodes**, using 10 edges/agent (47% fewer than FC)
+- 16.5% less total control cost than FC-ACS
+- The model uses a rank-based distance bias (`distance_bias_scale=0.5`, `top_k=10`) that encodes proximity as architectural inductive bias. With sf=0.05 and 5 PPO iterations, the learned attention scores provide small corrections on top of the K-nearest base.
 
 ### Git state
 Branch `exp/autonomous-research`. Modified: `evaluate_checkpoint.py`, `train.py`, `envs/env.py`.
