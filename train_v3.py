@@ -56,7 +56,7 @@ if __name__ == "__main__":
         "d_subobs": 4, "dr_rate": 0, "is_bias": False,
         "n_layers_decoder": 1, "n_layers_encoder": 3,
         "norm_eps": 1e-05, "num_heads": 4,
-        "scale_factor": 0.15,
+        "scale_factor": 0.10,
         "share_layers": False,
         "use_FNN_in_decoder": True, "use_residual_in_decoder": True,
         "aux_enabled": True, "aux_type": "pair_embedding",
@@ -71,7 +71,7 @@ if __name__ == "__main__":
 
     tune.run(
         GradLoggingPPO,
-        name="continuous_sf15_floor02_260527",
+        name="continuous_sf10_floor02_260527",
         local_dir="/workspace/test_results",
         checkpoint_freq=10,
         keep_checkpoints_num=3,
@@ -104,7 +104,7 @@ if __name__ == "__main__":
             "kl_coeff": 0,
             "clip_param": 0.15,
             "vf_clip_param": 256,
-            "grad_clip": None,
+            "grad_clip": 5.0,
             "kl_target": 0.01,
             "entropy_coeff": 0.0,
             "normalize_actions": False,

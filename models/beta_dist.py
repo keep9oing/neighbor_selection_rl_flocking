@@ -15,7 +15,7 @@ class TorchContinuousWeightDist(TorchDistributionWrapper):
         super().__init__(inputs, model)
         N = inputs.shape[-1] // 2
         self._spatial_n = int(round(N ** 0.5))
-        self.mean = inputs[..., :N]
+        self.mean = inputs[..., :N].clamp(-20.0, 20.0)
         self.log_std = inputs[..., N:].clamp(-5.0, 2.0)
         self.std = torch.exp(self.log_std)
         self.normal = torch.distributions.Normal(self.mean, self.std)

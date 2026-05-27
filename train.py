@@ -147,7 +147,7 @@ if __name__ == "__main__":
             "kl_coeff": 0,
             "clip_param": 0.15,
             "vf_clip_param": 256,
-            "grad_clip": None,
+            "grad_clip": 5.0,
             "kl_target": 0.01,
             "entropy_coeff": 0.0,
             "normalize_actions": False,
