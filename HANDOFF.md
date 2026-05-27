@@ -133,7 +133,15 @@ All under `/workspace/test_results/`. Key ones:
 - `wctrl_sweep_260523/` — w_ctrl {0.3, 0.5, 1.0}. Entropy stuck at 263 (entropy_coeff too strong).
 - `topk10_260523/` — top-K=10 v1 (collapsed) and v2 (bias=+2.0, checkpoints at 10/20/30).
 
-### What has been done this session
+### What was done in 2026-05-27 session (continuous action implementation)
+- Implemented continuous attention weights (Phase 11): env, model, distribution, eval
+- Ran 3 training variants: V1 (sf=0.15 no floor — collapsed at iter 7), V2 (sf=0.05 + floor 0.2), V3 (sf=0.15 + floor 0.2)
+- Formally evaluated V2 checkpoint 10 (100 episodes): -3.4% vs FC, 8.17 edges/agent
+- Formally evaluated V3 checkpoint 10 (100 episodes): +0.7% vs FC, 15.85 edges/agent
+- V2 and V3 continue training on GPUs 1 and 3 to 100 iterations
+- Committed implementation: `143cecc`
+
+### What has been done this session (prior)
 - **Modified `evaluate_checkpoint.py`** to support ego-centric model (`NeighborSelectionPPORLlib`). Auto-detects observation type from checkpoint params. Added mean_edges_per_agent and flocking_success metrics.
 - **Modified `envs/env.py`** to always compute `_conn_ratio` for logging, even when `w_conn=0`.
 - **Formally evaluated sf_sweep checkpoint 70** (50 episodes): exactly FC, 19.0 edges/agent, no selective behavior.
