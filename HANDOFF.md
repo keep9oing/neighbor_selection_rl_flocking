@@ -115,7 +115,11 @@ Tested the gap between sf=0.05 (Phase 5) and sf=0.2 (Phase 5, collapse).
 
 ### Running experiments
 - `continuous_sf05_floor02_260526` (GPU 1): sf=0.05, continuous action, weight floor 0.2. ~20 iterations done.
-- `continuous_sf15_floor02_260527` (GPU 3): sf=0.15, continuous action, weight floor 0.2. ~15 iterations done.
+- `continuous_sf15_floor02_260527` (GPU 3): **CRASHED at iter ~15** — NaN in attention scores.
+- V2 also crashed at iter 25 (same NaN). **Root cause: unbounded attention scores grow without limit.**
+- **Fix applied:** mean logit clamping [-20, 20] + grad_clip=5.0. Restarted as:
+  - V5 (GPU 1): sf=0.05, floor 0.2, grad_clip=5.0, mean clamp [-20,20]
+  - V6 (GPU 3): sf=0.10, floor 0.2, grad_clip=5.0, mean clamp [-20,20]
 Both running to 100 iterations.
 
 ### FC-ACS has NOT been beaten by RL
