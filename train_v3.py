@@ -71,7 +71,7 @@ if __name__ == "__main__":
 
     tune.run(
         GradLoggingPPO,
-        name="continuous_sf10_wctrl02_260527",
+        name="continuous_sf10_wctrl02_gc1_260527",
         local_dir="/workspace/test_results",
         checkpoint_freq=10,
         keep_checkpoints_num=3,
@@ -104,7 +104,7 @@ if __name__ == "__main__":
             "kl_coeff": 0,
             "clip_param": 0.15,
             "vf_clip_param": 256,
-            "grad_clip": 5.0,
+            "grad_clip": 1.0,
             "kl_target": 0.01,
             "entropy_coeff": 0.0,
             "normalize_actions": False,
