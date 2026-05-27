@@ -111,13 +111,15 @@ Tested the gap between sf=0.05 (Phase 5) and sf=0.2 (Phase 5, collapse).
   - **Conclusion: policy converged to FC.** No selective neighbor selection. Marginal reward difference (+5.8%) is within noise.
 - **Key finding:** Sharp phase transition between sf=0.1 (no learning) and sf=0.15 (immediate learning + eventual collapse). sf=0.15 is ON the collapse boundary — same instability as sf=0.2, just delayed. All learned policies converge to FC regardless of training dynamics.
 
-## Current State (2026-05-23)
+## Current State (2026-05-27)
 
 ### Running experiments
-None.
+- `continuous_sf05_floor02_260526` (GPU 1): sf=0.05, continuous action, weight floor 0.2. ~20 iterations done.
+- `continuous_sf15_floor02_260527` (GPU 3): sf=0.15, continuous action, weight floor 0.2. ~15 iterations done.
+Both running to 100 iterations.
 
 ### FC-ACS has NOT been beaten by RL
-**K=10 nearest heuristic beats FC** (paired t=4.94, p<0.001, reward -225 vs -272, 17% better). But no RL-trained policy has matched or exceeded KNN performance. The rank-biased checkpoint was equivalent to KNN with RL-added noise (RL made it 2.2 points worse). BC+RL fine-tuning collapsed immediately (sf=0.15 destroys BC initialization by iter 2).
+**K=10 nearest heuristic beats FC** (paired t=4.94, p<0.001, reward -225 vs -272, 17% better). No RL-trained policy has matched or exceeded KNN performance. Continuous action space (Phase 11) eliminates binary bistability and enables genuine per-edge differentiation, but has not yet beaten FC in formal evaluation. V3 (sf=0.15, floor 0.2) is closest at +0.7% reward (within noise), training continuing.
 
 ### Git state
 Branch `exp/autonomous-research`. Modified: `evaluate_checkpoint.py`, `train.py`, `envs/env.py`.
@@ -303,3 +305,49 @@ The top-K constraint successfully eliminates the FC/empty bistability, but the m
 - BC + RL fine-tuning: sf=0.15 destroys any initialization in 1-2 iters. Lower sf → no learning.
 - Reward weight tuning (w_ctrl, w_vel, w_pos): doesn't address the credit assignment gap.
 - Hyperparameter tuning (lr, clip, batch size, entropy_coeff): exhaustively explored. No combination stabilizes the binary action space.
+
+### Phase 11: Continuous attention weights (2026-05-27, in progress)
+
+**Implementation** (envs/env.py, models/ppo.py, models/beta_dist.py):
+- Env: `continuous_action=True` in EnvConfig. Action space changes from `Box(int8)` to `Box(float32, [0,1])`. `env_transition()` uses `neighbor_masks * action` (float multiply) instead of `np.logical_and`. Weight floor at 0.2 prevents spatial fragmentation.
+- Model: `attention_scores_to_logits()` outputs `[mean_logits, log_std_logits]` instead of `[-score, +score]` pairs. Mean logits = sf-scaled attention scores + 10.0 diagonal boost. Log_std = learnable global parameter (init -1.0, giving std≈0.37).
+- Distribution: `TorchContinuousWeightDist` (squashed Gaussian) — sigmoid(Normal(mean, std)). Avoids torch.distributions.Beta which triggers CUDA JIT failures on newer GPUs with CUDA 11.3. Actions reshaped to (N, N) to match action space.
+- Training: `normalize_actions=False` to prevent RLlib's default unsquashing.
+
+**V1: sf=0.15, no floor, log_std=0** (continuous_sf15_260526, 8 iters before kill):
+- Iter 1-3: Promising — vel_ent improved 0.68→0.49, conn stable 0.49→0.67. No binary bistability.
+- Iter 5-8: Weights drifted toward 0 (conn: 0.67→0.52→0.44→0.36→0.34). Spatial fragmentation at iter 7 (sp_ent=87, reward=-4480). Killed.
+- **Root cause:** High std (exp(0)=1.0) in pre-sigmoid space creates excessive weight variance. Combined with sf=0.15, the mean logits drift negative under noisy gradients.
+
+**V2: sf=0.05, floor=0.2, log_std=-1** (continuous_sf05_floor02_260526, running):
+- Very stable: vel_ent oscillates 0.29-0.35, conn stable at 0.50-0.58, sp_ent stable at 38-40.
+- But learning is slow — vel_ent plateaued after iter 2. sf=0.05 may be too conservative for even continuous actions.
+- Running to 100 iters to see if slow learning eventually differentiates neighbor weights.
+
+**V3: sf=0.15, floor=0.2, log_std=-1** (continuous_sf15_floor02_260527, running):
+- Hypothesis: the 0.2 weight floor prevents V1's fragmentation failure. sf=0.15's faster gradient should enable actual per-edge differentiation.
+- Running on GPU 3 in parallel with V2.
+
+**V2 checkpoint 10 formal eval** (100 episodes, deterministic):
+- RL: reward=-292.0±122.0, vel_ent=0.626±2.200, sp_ent=39.8, **edges/agent=8.17** (43% of FC)
+- FC: reward=-282.3±106.6, vel_ent=0.122±0.394, sp_ent=39.7, edges=19.0
+- RL -3.4% reward (WORSE), vel_ent worse. **50-episode eval showed +7.6% but was sample noise — 100-episode eval corrects to -3.4%.**
+- RL learned genuine selectivity (8.17 effective edges vs FC's 19.0) — first RL policy with real per-edge differentiation. But the selectivity is suboptimal: wrong neighbors downweighted.
+
+**Key finding:** Continuous weights eliminate binary bistability and enable per-edge differentiation. But credit assignment remains: 400 continuous decisions with scalar reward → the policy differentiates weights but can't attribute which edges help. The structural selectivity (8.17 vs 19.0 edges) is a genuine RL contribution, but it hurts rather than helps at checkpoint 10.
+
+**V3 checkpoint 10 formal eval** (100 episodes, deterministic):
+- RL: reward=-274.5±94.6, vel_ent=0.195±1.103, sp_ent=39.6, **edges/agent=15.85** (83% of FC)
+- FC: reward=-276.3±100.9, vel_ent=0.065±0.199, sp_ent=39.7, edges=19.0
+- RL +0.7% reward (essentially equal). V3 is less selective than V2 (15.85 vs 8.17 edges) but closer to FC performance.
+
+**Summary of continuous action space experiments (as of iter ~20):**
+- Continuous weights successfully eliminate binary bistability. Policy learns stably for 20+ iterations without collapsing to FC or empty.
+- Both V2 (sf=0.05) and V3 (sf=0.15) learn genuine per-edge differentiation (conn < 1.0).
+- Neither has beaten FC-ACS in formal evaluation. V2 is 3.4% worse; V3 is 0.7% better (within noise).
+- The per-edge credit assignment problem persists: 400 continuous decisions with one scalar reward → noisy gradient doesn't reliably identify which neighbors to downweight.
+- Training continues on both GPUs. Later checkpoints (50-100 iters) may show improvement as the policy gradually refines its neighbor weighting.
+
+**Remaining challenge:** The credit assignment problem limits per-edge learning regardless of action space type (binary or continuous). Continuous weights provide smoother gradients and eliminate bistability, but can't overcome the fundamental issue of attributing a scalar reward to 400 individual edge decisions. Per-agent reward decomposition remains the most promising next step.
+
+Training continues on V2 (GPU 1) and V3 (GPU 3) toward 100 iterations.

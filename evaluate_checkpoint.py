@@ -82,6 +82,7 @@ class RLPolicy:
             params = json.load(f)
 
         model_config = params.get("model", {}).get("custom_model_config", {})
+        self.continuous_action = model_config.get("continuous_action", False)
 
         obs_space = env.observation_space
         action_space = env.action_space
@@ -167,8 +168,14 @@ class RLPolicy:
             logits = logits.cpu().numpy()[0]
 
             num_agents_max = obs["padding_mask"].shape[0]
-            logits_reshaped = logits.reshape(num_agents_max, num_agents_max, 2)
-            action = np.argmax(logits_reshaped, axis=-1).astype(np.int8)
+            if self.continuous_action:
+                N2 = num_agents_max * num_agents_max
+                mean_logits = logits[:N2]
+                action = 1.0 / (1.0 + np.exp(-mean_logits))  # sigmoid
+                action = action.reshape(num_agents_max, num_agents_max).astype(np.float32)
+            else:
+                logits_reshaped = logits.reshape(num_agents_max, num_agents_max, 2)
+                action = np.argmax(logits_reshaped, axis=-1).astype(np.int8)
 
             return action
 
@@ -178,22 +185,21 @@ class PureACSPolicy:
     Pure ACS baseline - no neighbor selection.
     Uses fully connected network (all agents communicate with all).
     """
-    
+
+    def __init__(self, continuous=False):
+        self.continuous = continuous
+
     def __call__(self, obs: dict) -> np.ndarray:
         """Return fully connected action (all 1s with self-loops)."""
         padding_mask = obs['padding_mask']
         num_agents_max = len(padding_mask)
-        
-        # Fully connected: all agents connected to all
-        action = np.ones((num_agents_max, num_agents_max), dtype=np.int8)
-        
-        # Zero out connections to/from padding agents
+        dtype = np.float32 if self.continuous else np.int8
+
+        action = np.ones((num_agents_max, num_agents_max), dtype=dtype)
         padding_mask_2d = padding_mask[:, np.newaxis] & padding_mask[np.newaxis, :]
-        action = action * padding_mask_2d.astype(np.int8)
-        
-        # Ensure self-loops for active agents
-        action[np.arange(num_agents_max), np.arange(num_agents_max)] = padding_mask.astype(np.int8)
-        
+        action = action * padding_mask_2d.astype(dtype)
+        action[np.arange(num_agents_max), np.arange(num_agents_max)] = padding_mask.astype(dtype)
+
         return action
 
 
@@ -474,9 +480,17 @@ def main():
         os.makedirs(save_dir, exist_ok=True)
         print(f"Trajectory plots will be saved to: {save_dir}")
 
+    continuous_action = (params.get("env_config", {})
+                         .get("config", {})
+                         .get("env", {})
+                         .get("continuous_action", False)) if os.path.exists(params_path) else False
+    if continuous_action:
+        print("Detected continuous_action: True")
+
     config_overrides = {
         'num_agents_pool': [args.num_agents],
         'max_time_steps': args.max_steps,
+        'continuous_action': continuous_action,
     }
     env = create_env(config_overrides, observation_type=observation_type)
 
@@ -501,7 +515,7 @@ def main():
         rl_policy = None
     
     # Create baseline policy
-    acs_policy = PureACSPolicy()
+    acs_policy = PureACSPolicy(continuous=continuous_action)
     
     # For trajectory comparison, we need to run episodes with same initial conditions
     if args.save_trajectory and rl_policy is not None:

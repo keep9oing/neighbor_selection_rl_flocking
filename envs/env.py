@@ -80,6 +80,7 @@ class EnvConfig(BaseModel):
     # ACS neighbor selection option: if True, neighbor selection (action) applies only to heading (alignment) control,
     # while cohesion/separation uses the original (full) neighbor network
     apply_to_heading_only: bool = False
+    continuous_action: bool = False
 
 
 class Config(BaseModel):
@@ -184,8 +185,13 @@ class NeighborSelectionFlockingEnv(gym.Env):
 
         # Define ACTION SPACE
         self.action_dtype = None
+        self.continuous_action = self.config.env.continuous_action
         if self.config.env.env_mode == "single_env":
-            if self.config.env.action_type == "binary_vector":
+            if self.continuous_action:
+                self.action_dtype = np.float32
+                self.action_space = Box(low=0.0, high=1.0,
+                                        shape=(self.num_agents_max, self.num_agents_max), dtype=self.action_dtype)
+            elif self.config.env.action_type == "binary_vector":
                 self.action_dtype = np.int8
                 self.action_space = Box(low=0, high=1,
                                         shape=(self.num_agents_max, self.num_agents_max), dtype=self.action_dtype)
@@ -444,7 +450,8 @@ class NeighborSelectionFlockingEnv(gym.Env):
             self.neighbor_masks_hist = np.zeros((self.config.env.max_time_steps, self.num_agents_max, self.num_agents_max))
             self.initial_state = self.state
         if self.config.env.get_action_hist:
-            self.action_hist = np.zeros((self.config.env.max_time_steps, self.num_agents_max, self.num_agents_max), dtype=np.bool_)
+            _dtype = np.float32 if self.continuous_action else np.bool_
+            self.action_hist = np.zeros((self.config.env.max_time_steps, self.num_agents_max, self.num_agents_max), dtype=_dtype)
 
         return obs
 
@@ -461,6 +468,8 @@ class NeighborSelectionFlockingEnv(gym.Env):
         action_interpreted = self.interpret_action(model_output=action)
         joint_action = self.multi_to_single(action_interpreted) if self.config.env.env_mode == "multi_env" \
             else action_interpreted
+        if self.continuous_action:
+            joint_action = np.array(joint_action, dtype=np.float32)
         joint_action = self.to_binary_action(joint_action)  # (num_agents_max, num_agents_max)
         self.validate_action(action=joint_action,
                              neighbor_masks=state["neighbor_masks"], padding_mask=state["padding_mask"])
@@ -569,27 +578,23 @@ class NeighborSelectionFlockingEnv(gym.Env):
         :param padding_mask: (num_agents_max)
         :return: None
         """
-        # Check the dtype and shape of the action
-        if self.config.env.action_type == "binary_vector":
-            assert isinstance(action, np.ndarray), "action must be a numpy ndarray"
+        assert isinstance(action, np.ndarray), "action must be a numpy ndarray"
+        assert action.shape == (self.num_agents_max, self.num_agents_max), \
+            "action must be a ndarray of shape (num_agents_max, num_agents_max)"
+
+        if self.continuous_action:
+            padding_2d = padding_mask[:, None] & padding_mask[None, :]
+            valid = padding_2d & neighbor_masks
+            np.clip(action, 0.2, 1.0, out=action)
+            np.fill_diagonal(action, 1.0)
+            action[~valid] = 0.0
+        else:
             assert np.issubdtype(action.dtype, np.integer), "action must be a numpy integer type"
-            assert action.shape == (self.num_agents_max, self.num_agents_max), \
-                "action must be a ndarray of shape (num_agents_max, num_agents_max)"
-
-        # Ensure the diagonal elements are all ones (all with self-loops); if not, set them to ones
-        if not np.all(np.diag(action) == 1):
-            np.fill_diagonal(action, 1)  # Directly modifies the action array to set diagonal elements to 1
-            print("WARNING (env.validate_action): diag(action) not all 1; Self-loops fixed in 'action'.")
-
-        # Check action value based on the neighbor_mask and padding_mask
-        # Note: your model might output a masked action. If that's not available, you can ignore this part.
-        assert np.all((neighbor_masks | ~action)), "action[i, j] == 1 must not found if neighbor_mask[i, j] == 0"
-        assert np.all((padding_mask[:, None] | ~action)), "action[i, j] == 1 must not found if padding_mask[j] == 0"
-
-        # # Efficiently check for rows with all zeros (excluding self-loops)
-        # if self.time_step != 0:
-        #     assert np.all(action.sum(axis=1) - np.diag(action) > 0), \
-        #         "Each row in action, except self-loops, must have at least one True value"
+            if not np.all(np.diag(action) == 1):
+                np.fill_diagonal(action, 1)
+                print("WARNING (env.validate_action): diag(action) not all 1; Self-loops fixed in 'action'.")
+            assert np.all((neighbor_masks | ~action)), "action[i, j] == 1 must not found if neighbor_mask[i, j] == 0"
+            assert np.all((padding_mask[:, None] | ~action)), "action[i, j] == 1 must not found if padding_mask[j] == 0"
 
     def get_vicsek_action(self):
         neighbor_masks = self.state["neighbor_masks"]  # shape (num_agents_max, num_agents_max)
@@ -670,7 +675,10 @@ class NeighborSelectionFlockingEnv(gym.Env):
         # self.validate_action(action=action, neighbor_masks=state["neighbor_masks"], padding_mask=state["padding_mask"])
 
         # 0. Apply lazy message actions: alters the neighbor_masks!
-        lazy_listening_msg_masks = np.logical_and(state["neighbor_masks"], action)  # (num_agents_max, num_agents_max)
+        if self.continuous_action:
+            lazy_listening_msg_masks = state["neighbor_masks"].astype(np.float64) * np.clip(action.astype(np.float64), 0.2, 1.0)
+        else:
+            lazy_listening_msg_masks = np.logical_and(state["neighbor_masks"], action)  # (num_agents_max, num_agents_max)
 
         # 1. Get control inputs based on the flocking control algorithm with the lazy listener's network
         if self.config.env.task_type == "vicsek":
@@ -1316,7 +1324,7 @@ class NeighborSelectionFlockingEnv(gym.Env):
                 N = int(padding_mask.sum())
                 if N > 1:
                     real_edges = self.current_action[padding_mask][:, padding_mask]
-                    num_edges = int(real_edges.sum()) - N
+                    num_edges = float(real_edges.sum()) - N
                     max_edges = N * (N - 1)
                     self._conn_ratio = num_edges / max_edges
                     if w_conn > 0:

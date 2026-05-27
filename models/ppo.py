@@ -56,6 +56,7 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             #                                  i's own flock-center-frame state.
             self.top_k = cfg["top_k"] if "top_k" in cfg else None
             self.distance_bias_scale = cfg["distance_bias_scale"] if "distance_bias_scale" in cfg else 0.0
+            self.continuous_action = cfg.get("continuous_action", False)
             self._pretrained_weights_path = cfg.get("pretrained_weights_path", None)
             self.aux_enabled = cfg["aux_enabled"] if "aux_enabled" in cfg else False
             self.aux_loss_coef = cfg["aux_loss_coef"] if "aux_loss_coef" in cfg else 0.1
@@ -214,6 +215,9 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
         self._last_aux_loss = None        # scalar for actor aux
         self._last_aux_loss_critic = None # scalar for critic aux
 
+        if self.continuous_action:
+            self.action_log_std = nn.Parameter(torch.tensor([-1.0]))
+
         if self._pretrained_weights_path and os.path.exists(self._pretrained_weights_path):
             state = torch.load(self._pretrained_weights_path, map_location="cpu")
             self.load_state_dict(state, strict=False)
@@ -276,16 +280,13 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
 
     def attention_scores_to_logits(self, attention_scores: TensorType) -> TensorType:
         """
-        Maps attention scores to logits to follow the action distribution format (binary in multinomial dist)
-        :param attention_scores: (batch_size, num_agents_max, num_agents_max)
-        :return:
+        Maps attention scores to logits for the action distribution.
+        Binary mode: (B, N*N*2) — pairs of [-score, +score] for Categorical.
+        Continuous mode: (B, N*N*2) — [mean_logits, conc_logits] for Beta.
         """
         batch_size = attention_scores.shape[0]
         num_agents_max = attention_scores.shape[1]
 
-        # Attention schore scaling: tune this parameter..!
-        # scale_factor = 5e-3 or 5e-1
-        # Warning: this also scales the masked values from the MHA layer (1e9 * scale_factor > 1e2)
         scale_factor = self.scale_factor
         attention_scores *= scale_factor
 
@@ -299,28 +300,25 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             topk_mask = torch.zeros_like(attention_scores, dtype=torch.bool)
             topk_mask.scatter_(2, topk_idx, True)
             topk_mask = topk_mask | diag_mask.unsqueeze(0)
-            # Bias top-K toward selection (+2 → P≈0.98 at init), block non-top-K
             attention_scores = torch.where(topk_mask, attention_scores + 2.0,
                                            torch.ones_like(attention_scores) * -1e9)
 
-        large_val = 1e9
-        attention_scores = attention_scores + torch.diag_embed(attention_scores.new_full((num_agents_max,), large_val))
-
-        # Get negated attention scores
-        negated_attention_scores = -attention_scores
-
-        # Expand attention scores and negated attention scores
-        z_expanded = attention_scores.unsqueeze(-1)  # (batch_size, num_agents_max, num_agents_max, 1)
-        z_neg_expanded = negated_attention_scores.unsqueeze(-1)  # (batch_size, num_agents_max, num_agents_max, 1)
-
-        # Concatenate them in the last dimension
-        # z_concatenated: (batch_size, num_agents_max, num_agents_max, 2)
-        z_concatenated = torch.cat((z_neg_expanded, z_expanded), dim=-1)
-
-        # Reshape the tensor to 2D: (batch_size, num_agents_max * num_agents_max * 2)
-        logits = z_concatenated.reshape(batch_size, num_agents_max * num_agents_max * 2)
-
-        return logits  # (batch_size, num_agents_max * num_agents_max * 2)
+        if self.continuous_action:
+            attention_scores = attention_scores + torch.diag_embed(
+                attention_scores.new_full((num_agents_max,), 10.0))
+            mean_logits = attention_scores.reshape(batch_size, num_agents_max * num_agents_max)
+            conc_logits = self.action_log_std.expand(batch_size, num_agents_max * num_agents_max)
+            return torch.cat([mean_logits, conc_logits], dim=-1)
+        else:
+            large_val = 1e9
+            attention_scores = attention_scores + torch.diag_embed(
+                attention_scores.new_full((num_agents_max,), large_val))
+            negated_attention_scores = -attention_scores
+            z_expanded = attention_scores.unsqueeze(-1)
+            z_neg_expanded = negated_attention_scores.unsqueeze(-1)
+            z_concatenated = torch.cat((z_neg_expanded, z_expanded), dim=-1)
+            logits = z_concatenated.reshape(batch_size, num_agents_max * num_agents_max * 2)
+            return logits
 
     def value_function(self) -> TensorType:
         # assert self.values is not None, "self.values is None"
