@@ -16,7 +16,7 @@ if __name__ == "__main__":
     default_config_path = "./envs/default_env_config.yaml"
     my_config = load_config(default_config_path)
 
-    my_config.env.acs_train_w_ctrl = 0.02
+    my_config.env.acs_train_w_ctrl = 0.2
     my_config.env.acs_train_w_pos  = 1.0
     my_config.env.acs_train_w_vel  = 0.2
     my_config.env.acs_train_w_conn = 0.0
@@ -71,7 +71,7 @@ if __name__ == "__main__":
 
     tune.run(
         GradLoggingPPO,
-        name="continuous_sf10_floor02_260527",
+        name="continuous_sf10_wctrl02_260527",
         local_dir="/workspace/test_results",
         checkpoint_freq=10,
         keep_checkpoints_num=3,

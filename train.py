@@ -24,7 +24,7 @@ if __name__ == "__main__":
     my_config = load_config(default_config_path)
 
     # environment configs
-    my_config.env.acs_train_w_ctrl = 0.02
+    my_config.env.acs_train_w_ctrl = 0.1
     my_config.env.acs_train_w_pos  = 1.0
     my_config.env.acs_train_w_vel  = 0.2
     my_config.env.acs_train_w_conn = 0.0
@@ -91,7 +91,7 @@ if __name__ == "__main__":
         "n_layers_encoder": 3,
         "norm_eps": 1e-05,
         "num_heads": 4,
-        "scale_factor": 0.05,
+        "scale_factor": 0.10,
         "share_layers": False,
         "use_FNN_in_decoder": True,
         "use_residual_in_decoder": True,
@@ -110,7 +110,7 @@ if __name__ == "__main__":
 
     tune.run(
         GradLoggingPPO,
-        name="continuous_sf05_floor02_260526",
+        name="continuous_sf10_wctrl01_260527",
         local_dir="/workspace/test_results",
         checkpoint_freq=10,
         keep_checkpoints_num=3,

@@ -362,4 +362,13 @@ The top-K constraint successfully eliminates the FC/empty bistability, but the m
 
 **Remaining challenge:** The credit assignment problem limits per-edge learning regardless of action space type (binary or continuous). Continuous weights provide smoother gradients and eliminate bistability, but can't overcome the fundamental issue of attributing a scalar reward to 400 individual edge decisions. Per-agent reward decomposition remains the most promising next step.
 
-Training continues on V2 (GPU 1) and V3 (GPU 3) toward 100 iterations.
+**V5/V6 (w_ctrl=0.02, NaN fix):** V5 (sf=0.05) showed zero weight learning (conn stuck at 0.503 due to grad_clip+sf being too conservative). V6 (sf=0.10) converged toward FC (conn→0.75 by iter 7). Killed both — w_ctrl=0.02 provides no selectivity incentive.
+
+**V7 (w_ctrl=0.1, sf=0.10):** conn steadily decreased 0.50→0.24 over 10 iters. vel_ent worsened 0.29→0.98. Same overshoot toward empty as binary but in slow motion — the floor at 0.2 prevents collapse but the policy keeps pushing toward minimum weight.
+
+**V8 (w_ctrl=0.2, sf=0.10):** conn dipped to 0.37 then recovered to 0.62 by iter 10. vel_ent: 0.29→1.39→0.56. The stronger w_ctrl caused initial overshoot but alignment loss pulled it back. Shows oscillatory dynamics around a balance point but hasn't converged.
+
+**Session conclusion:** Continuous attention weights eliminate binary bistability and enable smooth gradient-based exploration of the weight space. However, the per-edge credit assignment problem remains the fundamental bottleneck. With 400 continuous decisions and one scalar reward, the policy cannot reliably determine which specific neighbors to up/downweight. It oscillates between global weight adjustments (all up or all down) without per-edge discrimination.
+
+### Running experiments
+V7 (GPU 1, w_ctrl=0.1) and V8 (GPU 3, w_ctrl=0.2) running to 100 iterations. Checkpoints at every 10 iters. Evaluate best checkpoints from each in next session.
