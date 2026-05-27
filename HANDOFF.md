@@ -381,8 +381,13 @@ V9 (GPU 3, w_ctrl=0.2, grad_clip=1.0) running to 100 iterations.
 
 ### Conclusion on continuous attention weights
 Continuous weights solve bistability but NOT credit assignment. All evaluated checkpoints are worse than or equal to FC-ACS:
-- V2 ckpt 10 (w_ctrl=0.02): -3.4% vs FC
-- V3 ckpt 10 (w_ctrl=0.02): +0.7% vs FC (noise)  
-- V9 ckpt 10 (w_ctrl=0.2): -8.0% vs FC
+- V2 ckpt 10 (w_ctrl=0.02, sf=0.05): -3.4% vs FC, 8.17 edges
+- V3 ckpt 10 (w_ctrl=0.02, sf=0.15): +0.7% vs FC (noise), 15.85 edges
+- V9 ckpt 10 (w_ctrl=0.2, sf=0.10): -8.0% vs FC, 9.99 edges
+- V9 ckpt 20 (w_ctrl=0.2, sf=0.10): -59.0% vs FC, 11.92 edges (oscillation)
+
+Training dynamics: the policy oscillates between selective (conn=0.3-0.5, high vel_ent) and FC-like (conn=0.7-0.9, low vel_ent) phases without converging to a stable intermediate. Checkpoints from different phases have wildly different eval quality.
+
+**NaN stability**: required grad_clip (5.0→1.0) + nan_to_num in distribution + mean clamp [-20,20]. Even with sf=0.05, models crashed at iter 25 without these protections.
 
 The next approach should be **per-agent reward decomposition** — the only approach that addresses the fundamental credit assignment bottleneck (400 decisions, 1 scalar reward).
