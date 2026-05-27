@@ -14,6 +14,8 @@ env:
     num_agents_pool: [20]  # Must be specified
     # action_type options:
     #   "binary_vector"  - per-step (N,N) binary adjacency over all neighbors (default)
-    #   "neighbor_index" - per-agent ONE neighbor index (self allowed); applied only at step 0 and frozen
-    #                      for the rest of the episode. Selected neighbors = those with dist <= dist(i, anchor_i).
+    #   "neighbor_index" - per-agent ONE neighbor index j_i (self allowed) at step 0. The env converts
+    #                      j_i into k_i = rank of j_i in i's current sorted distances to non-self active
+    #                      agents (k=0 if j_i == i). k_i is frozen for the rest of the episode; each step
+    #                      i uses its current top-k_i non-self closest active agents. Heterogeneous k per agent.
     # action_type: binary_vector

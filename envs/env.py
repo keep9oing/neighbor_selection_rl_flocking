@@ -168,7 +168,8 @@ class NeighborSelectionFlockingEnv(gym.Env):
         self.has_lost_comm = None
         self.lost_comm_step = None
         self.time_step = None
-        self._cached_first_action = None
+        self._cached_k_per_agent = None
+        self._last_anchor_idx = None
         self._last_neighbor_index_diagnostics = None
         # self.agent_time_step = None
         # Vicsek hist
@@ -187,9 +188,11 @@ class NeighborSelectionFlockingEnv(gym.Env):
                 self.action_space = Box(low=0, high=1,
                                         shape=(self.num_agents_max, self.num_agents_max), dtype=self.action_dtype)
             elif self.config.env.action_type == "neighbor_index":
-                # Each agent picks ONE neighbor index (self allowed) at episode start; that distance becomes
-                # the threshold for which neighbors are used in flocking control. Action is cached on first step
-                # of an episode and reused for the remainder of the episode.
+                # Each agent picks ONE neighbor index j (self allowed) at episode start. On the first step,
+                # the env converts j into k_i = rank of j in i's current sorted distances to non-self active
+                # agents (k=0 if j==i). k_i is then frozen for the rest of the episode, and at every step the
+                # env recomputes i's current top-k_i nearest non-self active agents as the flocking input.
+                # Each agent can therefore hold a different k -> heterogeneous k-NN flocking.
                 self.action_dtype = np.int64
                 self.action_space = MultiDiscrete([self.num_agents_max] * self.num_agents_max)
             else:
@@ -331,8 +334,9 @@ class NeighborSelectionFlockingEnv(gym.Env):
         self.reset()
         # Init time steps
         self.time_step = 0
-        # Reset cached action for neighbor_index action_type (reset() already does this, but be explicit)
-        self._cached_first_action = None
+        # Reset cached k vector for neighbor_index action_type (reset() already does this, but be explicit)
+        self._cached_k_per_agent = None
+        self._last_anchor_idx = None
         self._last_neighbor_index_diagnostics = None
         # self.agent_time_step = np.zeros(self.num_agents_max, dtype=np.int32)
 
@@ -386,8 +390,9 @@ class NeighborSelectionFlockingEnv(gym.Env):
         self.time_step = 0
         # self.agent_time_step = np.zeros(self.num_agents_max, dtype=np.int32)
 
-        # Reset cached action for neighbor_index action_type (set on first step of episode and frozen thereafter)
-        self._cached_first_action = None
+        # Reset cached k vector for neighbor_index action_type (set on first step of episode and frozen thereafter)
+        self._cached_k_per_agent = None
+        self._last_anchor_idx = None
         self._last_neighbor_index_diagnostics = None
 
         # Get initial num_agents
@@ -444,12 +449,23 @@ class NeighborSelectionFlockingEnv(gym.Env):
         state = self.state  # state of the class (flock);
         rel_state = self.rel_state  # did NOT consider the communication network, DELIBERATELY
 
-        # Action persistence for neighbor_index: cache the action from the first step of the episode and reuse it.
-        # Subsequent step() calls still receive new actions from the policy, but they are discarded.
+        # k-NN persistence for neighbor_index: on step 0 we convert the anchor-index action to a per-agent k
+        # (rank of the chosen anchor in i's current sorted distances to non-self active agents), then freeze k
+        # for the rest of the episode. Subsequent step() calls still receive new actions from the policy, but
+        # they are discarded - to_binary_action() consumes the cached k vector and recomputes the top-k neighbors
+        # against the CURRENT state every step.
         if self.config.env.action_type == "neighbor_index":
-            if self._cached_first_action is None:
-                self._cached_first_action = np.asarray(action, dtype=np.int64).copy()
-            action = self._cached_first_action
+            if self._cached_k_per_agent is None:
+                anchor_idx = np.asarray(action, dtype=np.int64).copy()
+                assert anchor_idx.shape == (self.num_agents_max,), \
+                    "neighbor_index step-0 action must have shape (num_agents_max,)"
+                # Anchor indices for active agents must point to non-padding agents.
+                pad = state["padding_mask"]
+                assert np.all(pad[anchor_idx[pad]]), \
+                    "neighbor_index anchor indices must point to non-padding agents"
+                self._last_anchor_idx = anchor_idx
+                self._cached_k_per_agent = self._anchor_to_k(anchor_idx)
+            action = self._cached_k_per_agent
 
         # Interpret the action (i.e. model output)
         action_interpreted = self.interpret_action(model_output=action)
@@ -488,11 +504,11 @@ class NeighborSelectionFlockingEnv(gym.Env):
         }
         if self.config.env.action_type == "neighbor_index" and self._last_neighbor_index_diagnostics is not None:
             info.update({
-                "anchor_distance_mean": self._last_neighbor_index_diagnostics["anchor_distance_mean"],
-                "anchor_distance_min": self._last_neighbor_index_diagnostics["anchor_distance_min"],
-                "anchor_distance_max": self._last_neighbor_index_diagnostics["anchor_distance_max"],
+                "k_mean": self._last_neighbor_index_diagnostics["k_mean"],
+                "k_min": self._last_neighbor_index_diagnostics["k_min"],
+                "k_max": self._last_neighbor_index_diagnostics["k_max"],
                 "selected_neighbor_count_mean": self._last_neighbor_index_diagnostics["selected_neighbor_count_mean"],
-                "self_chosen_ratio": self._last_neighbor_index_diagnostics["self_chosen_ratio"],
+                "isolated_ratio": self._last_neighbor_index_diagnostics["isolated_ratio"],
             })
         info = self.get_extra_info(info, next_state, next_rel_state, control_inputs, rewards, done)
         if self.config.env.get_state_hist:
@@ -577,14 +593,11 @@ class NeighborSelectionFlockingEnv(gym.Env):
                 "action must be a ndarray of shape (num_agents_max, num_agents_max)"
         elif self.config.env.action_type == "neighbor_index":
             # After to_binary_action, `action` is already an (N, N) int8 binary network. Check it here too.
+            # (Anchor-points-to-padding validation runs once in step() at the anchor->k conversion site.)
             assert isinstance(action, np.ndarray), "action must be a numpy ndarray"
             assert np.issubdtype(action.dtype, np.integer), "action must be a numpy integer type"
             assert action.shape == (self.num_agents_max, self.num_agents_max), \
                 "action must be a ndarray of shape (num_agents_max, num_agents_max) after to_binary_action"
-            # The cached anchor indices should not point to padding agents (would be invalid).
-            if self._cached_first_action is not None:
-                assert np.all(padding_mask[self._cached_first_action[padding_mask]]), \
-                    "neighbor_index anchor indices must point to non-padding agents"
 
         # Ensure the diagonal elements are all ones (all with self-loops); if not, set them to ones
         if not np.all(np.diag(action) == 1):
@@ -613,45 +626,64 @@ class NeighborSelectionFlockingEnv(gym.Env):
 
         return vicsek_action
 
+    def _anchor_to_k(self, anchor_idx):
+        """Convert step-0 anchor indices to a per-agent k vector against the current rel_state.
+
+        k_i = number of non-self active agents j with dist(i, j) <= dist(i, anchor_idx[i]).
+        Self-anchor (anchor_idx[i] == i) yields k_i = 0 (anchor dist = 0; no other active agent ties at 0).
+        """
+        N = self.num_agents_max
+        padding_mask = self.state["padding_mask"]
+        rel_dists = self.get_relative_state(self.state)["rel_agent_dists"]  # (N, N)
+
+        non_self_active = padding_mask[np.newaxis, :] & ~np.eye(N, dtype=bool)  # (N, N)
+        anchor_dists = rel_dists[np.arange(N), anchor_idx]                      # (N,)
+        k_per_agent = (non_self_active & (rel_dists <= anchor_dists[:, np.newaxis])).sum(axis=1).astype(np.int64)
+        # Inactive agents' k is irrelevant; zero it out for cleanliness.
+        k_per_agent[~padding_mask] = 0
+        return k_per_agent
+
     def to_binary_action(self, action_in_another_type):
         if self.config.env.action_type == "binary_vector":
             return action_in_another_type
         elif self.config.env.action_type == "neighbor_index":
-            # action_in_another_type: ndarray of shape (num_agents_max,), each entry is an int neighbor index in [0, N-1]
-            # Semantics: agent i picks an anchor j_i (self allowed). Threshold = dist(i, j_i).
-            # Selected neighbors: { k : dist(i, k) <= dist(i, j_i) } intersected with neighbor_masks and padding mask.
-            # If j_i == i (self), threshold = 0 -> no other neighbors selected; self-loop only.
-            anchor_idx = np.asarray(action_in_another_type, dtype=np.int64)
-            assert anchor_idx.shape == (self.num_agents_max,), \
-                "neighbor_index action must be a ndarray of shape (num_agents_max,)"
+            # action_in_another_type: ndarray of shape (num_agents_max,), per-agent k (frozen at step 0).
+            # Semantics: select agent i's top-k_i closest non-self active agents under the CURRENT distances.
+            # k_i == 0 -> only self-loop, no other neighbors. Pure k-NN: not intersected with neighbor_masks.
+            k_per_agent = np.asarray(action_in_another_type, dtype=np.int64)
+            assert k_per_agent.shape == (self.num_agents_max,), \
+                "neighbor_index cached k vector must have shape (num_agents_max,)"
 
+            N = self.num_agents_max
             padding_mask = self.state["padding_mask"]  # (N,)
-            padding_mask_2d = padding_mask[:, np.newaxis] & padding_mask[np.newaxis, :]
-
             rel_state = self.get_relative_state(state=self.state)
             rel_agent_dists = rel_state["rel_agent_dists"]  # (N, N), 0 on diagonal
 
-            row_idx = np.arange(self.num_agents_max)
-            thresholds = rel_agent_dists[row_idx, anchor_idx]  # (N,)
-            dist_mask = rel_agent_dists <= thresholds[:, np.newaxis]  # (N, N), <= per user spec (tie included)
-            selected_network = self.state["neighbor_masks"] & dist_mask & padding_mask_2d  # (N, N) bool
+            # Mask non-eligible cells (self + padding columns) to +inf so they sort last.
+            non_self_active = padding_mask[np.newaxis, :] & ~np.eye(N, dtype=bool)  # (N, N)
+            masked_dists = np.where(non_self_active, rel_agent_dists, np.inf)  # (N, N)
 
+            # rank[i, j] = position of j in row-i's sorted ascending distance list (0-indexed).
+            sorted_idx = np.argsort(masked_dists, axis=1)  # (N, N)
+            ranks = np.argsort(sorted_idx, axis=1)         # (N, N)
+
+            # j is selected iff rank < k_i AND j is non-self active.
+            selected_network = (ranks < k_per_agent[:, np.newaxis]) & non_self_active  # (N, N)
+
+            # Force self-loops on active agents.
             active_agents_indices = np.nonzero(padding_mask)[0]
-            selected_network[active_agents_indices, active_agents_indices] = True  # force self-loops
+            selected_network[active_agents_indices, active_agents_indices] = True
 
-            # Diagnostics over active agents only
-            active_mask = padding_mask
-            active_anchor_idx = anchor_idx[active_mask]
-            active_thresholds = thresholds[active_mask]
-            selected_counts = selected_network[active_mask].sum(axis=1)
-            self_chosen = (active_anchor_idx == np.nonzero(active_mask)[0])
+            # Diagnostics over active agents only.
+            active_k = k_per_agent[padding_mask]
+            selected_counts = selected_network[padding_mask].sum(axis=1)
             self._last_neighbor_index_diagnostics = {
-                "anchor_idx": anchor_idx.copy(),
-                "anchor_distance_mean": float(active_thresholds.mean()),
-                "anchor_distance_min": float(active_thresholds.min()),
-                "anchor_distance_max": float(active_thresholds.max()),
+                "k_per_agent": k_per_agent.copy(),
+                "k_mean": float(active_k.mean()),
+                "k_min": int(active_k.min()),
+                "k_max": int(active_k.max()),
                 "selected_neighbor_count_mean": float(selected_counts.mean()),
-                "self_chosen_ratio": float(self_chosen.mean()),
+                "isolated_ratio": float((active_k == 0).mean()),
             }
 
             return selected_network.astype(np.int8)

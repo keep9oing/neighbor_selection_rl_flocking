@@ -2,9 +2,12 @@
 PPO model for the `neighbor_index` action type.
 
 The action is a per-agent integer index in [0, num_agents_max - 1]: each agent picks ONE
-reference neighbor (self allowed). The env then uses only those neighbors whose Euclidean
-distance is <= dist(i, anchor_i) for flocking control. The action is set at episode start
-and frozen for the rest of the episode (handled inside the env).
+reference neighbor j_i (self allowed). On the first step of the episode the env converts
+j_i into k_i = rank of j_i in i's current sorted distances to non-self active agents
+(k=0 if j_i == i). k_i is then frozen for the rest of the episode, and at every step the
+env recomputes i's current top-k_i nearest non-self active agents for flocking control.
+Different agents can hold different k. The action is set at episode start and frozen
+thereafter (handled inside the env).
 
 Architecture: reuses the encoder/decoder/pointer-attention stack from `models/ppo.py`. The
 existing `NeighborSelectorTorch` already produces `(B, N, N)` raw attention scores via
