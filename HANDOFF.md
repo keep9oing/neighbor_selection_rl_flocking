@@ -292,19 +292,40 @@ The top-K constraint successfully eliminates the FC/empty bistability, but the m
 4. **Two orthogonal credit assignment dimensions:** (a) agent-level (which agent's decisions were good/bad?) — addressed by per-agent decomposition; (b) temporal (which timesteps' decisions led to good/bad outcomes?) — addressed by GAE/value function but overwhelmed by noise. Both dimensions must be solved simultaneously.
 5. **REINFORCE instability without PPO.** Replacing PPO's surrogate with REINFORCE (no importance sampling, no clipping) causes entropy collapse in 2-3 iterations with sgd_iter=5. Reducing to sgd_iter=1 with entropy bonus stabilizes training but reduces sample efficiency, and the policy still converges to FC.
 
+### Phase 13: Distance-supervised auxiliary loss (2026-05-27)
+
+**Key insight from Phase 12:** Centralized PPO with 400 continuous actions and scalar advantages cannot learn per-edge selectivity regardless of reward shaping. The per-edge gradient is determined by the model's internal structure (attention scores), not by the reward. Solution: directly supervise the attention scores via auxiliary loss.
+
+**Implementation** (models/ppo.py, envs/env.py):
+- `dist_aux_coef` config param controls the auxiliary loss weight.
+- In `forward()`, caches raw attention scores `att` and squared distances `dist_sq` from observations.
+- In `custom_loss()`, computes `MSE(att, target_score)` where target provides per-edge supervision.
+- Also added `acs_train_w_align` for per-agent alignment reward (`get_extra_info`, `compute_custom_reward`).
+
+**V1 (target = -distance, dist_aux_coef=1.0, w_ctrl=0.1):**
+- Training: conn dropped steadily from 0.51 → 0.38 over 10 iters. Entropy stable 160-167.
+- **Formal eval (100 episodes, ckpt 10):** RL reward=-276.1±79.1, FC reward=-270.7±103.9, diff=-2.0%. **edges=7.11** (genuinely selective). But too sparse — K=7 is below the K=10 optimum.
+- Root cause: target=-dist pushes ALL attention scores negative, causing continuous conn decline.
+
+**V2 (target = rank-centered K=10, dist_aux_coef=1.0, w_ctrl=0.1):**
+- Target: `(K - 0.5 - rank) / K` where K=10. Positive for 10 nearest, negative for rest.
+- Training (3 iters so far): conn stable at 0.487 (~9.3 edges), vel_ent=0.28-0.31, entropy stable 166.
+- **In progress.** Checkpoint 10 not yet reached. Training dynamics are the most promising seen across all phases — conn stable near K=10, no FC convergence, no entropy collapse.
+
+**Key finding:** Distance-supervised attention provides the per-edge credit signal that reward-based methods lack. The auxiliary loss directly teaches the model which edges to select (nearby) and reject (far), bypassing the scalar-advantage bottleneck entirely. The PPO loss then fine-tunes overall policy quality.
+
 ## Current State (2026-05-27)
 
 ### Running experiments
-None. All training killed.
+`distaux_v2_rank10_260527` — distance aux with rank-based K=10 target, w_ctrl=0.1, sf=0.10. Training on GPU 1. At iter 3, conn=0.487, vel_ent=0.31.
 
 ### FC-ACS has NOT been beaten by RL
-**K=10 nearest heuristic beats FC** (paired t=4.94, p<0.001, reward -225 vs -272, 17% better). No RL-trained policy has matched or exceeded KNN performance. Binary action space has bistability (Phases 5-10). Continuous action space (Phase 11) eliminates bistability but per-edge credit assignment remains unsolved. Per-agent reward decomposition (Phase 12) addresses agent-level credit but the per-step reward signal still pushes toward FC.
+**K=10 nearest heuristic beats FC** (paired t=4.94, p<0.001, reward -225 vs -272, 17% better). dist_aux v1 achieved genuine selectivity (7 edges/agent) but was -2% vs FC (too sparse). dist_aux v2 (K=10 target) is most promising, training in progress.
 
 ### Git state
-Branch `exp/autonomous-research`. Latest commit: `c74e308`.
-New files from prior sessions: `models/beta_dist.py`, `train_v3.py`, `run_eval.sh`.
+Branch `exp/autonomous-research`. Latest commit: `231f6a9`.
 New files this session: `train_peragent.py`.
-Modified this session: `envs/env.py` (per_agent_rewards in info), `models/ppo.py` (per-agent credit in custom_loss), `callbacks.py` (on_postprocess_trajectory).
+Modified this session: `envs/env.py` (per_agent_rewards, alignment reward, w_align), `models/ppo.py` (per-agent credit + dist_aux), `callbacks.py` (on_postprocess_trajectory).
 
 ### Experiment results on disk
 All under `/workspace/test_results/`. Key ones from prior sessions:
