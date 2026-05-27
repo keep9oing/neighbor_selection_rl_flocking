@@ -385,6 +385,7 @@ Continuous weights solve bistability but NOT credit assignment. All evaluated ch
 - V3 ckpt 10 (w_ctrl=0.02, sf=0.15): +0.7% vs FC (noise), 15.85 edges
 - V9 ckpt 10 (w_ctrl=0.2, sf=0.10): -8.0% vs FC, 9.99 edges
 - V9 ckpt 20 (w_ctrl=0.2, sf=0.10): -59.0% vs FC, 11.92 edges (oscillation)
+- V9 ckpt 30: **all NaN** — model weights corrupted despite nan_to_num training protection
 
 Training dynamics: the policy oscillates between selective (conn=0.3-0.5, high vel_ent) and FC-like (conn=0.7-0.9, low vel_ent) phases without converging to a stable intermediate. Checkpoints from different phases have wildly different eval quality.
 
