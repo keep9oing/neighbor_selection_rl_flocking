@@ -6,7 +6,7 @@ Train an ego-centric RL policy that, given each agent's local observation, selec
 
 **Success metric:** The ego-centric policy must **clearly outperform the fully-connected ACS baseline** — faster convergence to flocking and/or better eval reward. The centralized-obs model already achieved this under a **relaxed convergence condition (vel_ent < 1.0 instead of the default 0.1)**: it converges faster and achieves better eval reward than FC-ACS. The ego-centric model should target the same. Under FC, ego-centric and centralized observations are mathematically interconvertible, so a parameter-sharing ego-centric policy can in principle replicate the centralized policy's decisions.
 
-**Current status: FC-ACS has NOT been beaten by RL.** K=10 nearest heuristic beats FC by 17% (t=4.94), confirming selective IS better. But no RL-trained ego-centric policy has matched KNN performance. The binary action space + scalar reward architecture prevents RL from learning per-edge credit assignment.
+**Current status: FC-ACS has NOT been beaten by RL.** K=10 nearest heuristic beats FC by 17% (t=4.94), confirming selective IS better. But no RL-trained ego-centric policy has matched KNN performance. Binary action space has bistability; continuous action space (Phase 11) eliminates bistability but per-edge credit assignment remains unsolved.
 
 **Evaluation metrics** (logged by callbacks):
 - **Episode reward** — primary metric. Sum of per-agent ACS rewards (`env._compute_rewards()`): negative heading-rate control cost + cruise cost. Must clearly exceed FC-ACS baseline.
@@ -20,7 +20,7 @@ Train an ego-centric RL policy that, given each agent's local observation, selec
 ### Fixed
 - **Communication:** fully-connected visibility (`comm_range=None`). Every agent CAN observe every other agent — the policy decides which to LISTEN to.
 - **Observation:** ego-centric (`observation_type="ego_centric"`). Each agent sees relative positions/headings of all others in its own heading frame. Shape `(N_max, N_max, obs_dim)`.
-- **Action:** binary adjacency matrix `(N_max, N_max)` int8. `action[i,j]=1` means agent i listens to agent j. Diagonal must be 1 (self-loop). Masking enforced.
+- **Action:** binary adjacency matrix `(N_max, N_max)` int8, OR continuous weights `(N_max, N_max)` float32 ∈ [0,1] (when `continuous_action=True`). Diagonal must be 1 (self-loop). Masking enforced.
 - **Controller:** ACS (Active Cohesive Swarm). The policy does NOT control motion — it only selects neighbors. The ACS controller converts the subgraph into heading-rate commands.
 - **Pinned stack:** Ray 2.1.0, Torch 1.12.1, Pydantic v1, Gym 0.23.1. See CLAUDE.md.
 
@@ -28,27 +28,28 @@ Train an ego-centric RL policy that, given each agent's local observation, selec
 - RL-driven approaches: PPO, SAC, REINFORCE, different action-space designs (autoregressive, top-K selection, pointer networks, etc.)
 - Reward reshaping, auxiliary tasks, training dynamics tuning
 - Architecture changes to the policy network
+- **Per-agent reward decomposition** (highest priority — see "Recommended next approaches")
 
 ### Out of scope
 - Purely parametric heuristic approaches (e.g., learning a disk radius, learning weights within a fixed heuristic topology). The policy must make per-agent, per-neighbor, per-step selection decisions via RL, not reduce to tuning a few parameters of an existing heuristic.
 
 ## Key Files (see CLAUDE.md for full architecture)
 
-- `envs/env.py` — environment. `_compute_rewards()` (line ~985): ACS reward (negative control cost). `compute_custom_reward()` (line ~1285): shaped training reward (spatial + velocity error + control cost + optional connection cost).
-- `models/ppo.py` — ego-centric Transformer model. `scale_factor` (line ~49, 265–268): multiplies raw attention scores before logit formation — critically affects gradient flow.
+- `envs/env.py` — environment. `continuous_action` flag enables float32 weighted actions. `_compute_rewards()` (line ~985): ACS reward (negative control cost). `compute_custom_reward()` (line ~1290): shaped training reward (spatial + velocity error + control cost + optional connection cost).
+- `models/ppo.py` — ego-centric Transformer model. `continuous_action` flag switches output from `[-score, +score]` pairs to `[mean_logit, log_std_logit]`. `scale_factor` multiplies raw attention scores — critically affects gradient flow.
+- `models/beta_dist.py` — `TorchContinuousWeightDist`: squashed Gaussian distribution for continuous [0,1] actions. Uses sigmoid(Normal) to avoid Beta distribution's CUDA JIT issues. Includes NaN protection (nan_to_num + clamp).
 - `models/ppo_centralized.py` — centralized variant (NOT used in current experiments).
 - `grad_logging_ppo.py` — custom PPO subclass that logs pre-clip gradient norms into `learner_stats`.
 - `callbacks.py` — logs `final_spatial_entropy`, `final_velocity_entropy`, `flocking_success`, `final_conn_ratio`.
-- `evaluate_checkpoint.py` — compares a checkpoint against Pure-ACS FC baseline. **NOTE: loads `NeighborSelectionPPORLlibCentralized` — cannot evaluate ego-centric checkpoints without modification.**
+- `evaluate_checkpoint.py` — compares a checkpoint against Pure-ACS FC baseline. Supports both ego-centric and centralized models. Auto-detects `continuous_action` from checkpoint params.
 - `baselines.py` — heuristic baselines.
-- `train.py` — current training config. Set for sf sweep (sf grid_search over {0.07, 0.1, 0.15}).
-- `check_sweep.py` — utility to monitor sweep progress.
+- `train.py` — training config. Currently set for continuous action with sf=0.10, w_ctrl=0.1, grad_clip=5.0.
+- `train_v3.py` — parallel training variant. Currently set for continuous action with sf=0.10, w_ctrl=0.2, grad_clip=1.0.
 
 ## FC-ACS Baseline Performance
-Pure fully-connected deterministic ACS (10 episodes):
-- 5/10 episodes: early termination, sp_ent≈37, vel_ent≈0.10 (**successful flocking**)
-- 5/10 episodes: 1000 steps, sp_ent≈41, vel_ent≈0.16–0.39 (still converging)
-- Stochastic near-FC (from learned policy, ~5% per-edge dropout): 0/20 episodes achieve flocking
+Pure fully-connected deterministic ACS (100 episodes, from V9 ckpt 10 eval):
+- reward=-266.2±100.6, vel_ent=0.069±0.194, sp_ent=39.6±1.2, edges=19.0
+Note: FC performance varies slightly across eval runs due to random initial conditions.
 
 ## Research Trajectory & Key Findings
 
@@ -110,94 +111,6 @@ Tested the gap between sf=0.05 (Phase 5) and sf=0.2 (Phase 5, collapse).
   - FC-ACS: reward=-274.4±106.9, vel_ent=0.23±1.11, sp_ent=39.8±1.6, flocking_success=0/50, edges=19.0
   - **Conclusion: policy converged to FC.** No selective neighbor selection. Marginal reward difference (+5.8%) is within noise.
 - **Key finding:** Sharp phase transition between sf=0.1 (no learning) and sf=0.15 (immediate learning + eventual collapse). sf=0.15 is ON the collapse boundary — same instability as sf=0.2, just delayed. All learned policies converge to FC regardless of training dynamics.
-
-## Current State (2026-05-27)
-
-### Running experiments
-- `continuous_sf05_floor02_260526` (GPU 1): sf=0.05, continuous action, weight floor 0.2. ~20 iterations done.
-- `continuous_sf15_floor02_260527` (GPU 3): **CRASHED at iter ~15** — NaN in attention scores.
-- V2 also crashed at iter 25 (same NaN). **Root cause: unbounded attention scores grow without limit.**
-- **Fix applied:** mean logit clamping [-20, 20] + grad_clip=5.0. Restarted as:
-  - V5 (GPU 1): sf=0.05, floor 0.2, grad_clip=5.0, mean clamp [-20,20]
-  - V6 (GPU 3): sf=0.10, floor 0.2, grad_clip=5.0, mean clamp [-20,20]
-Both running to 100 iterations.
-
-### FC-ACS has NOT been beaten by RL
-**K=10 nearest heuristic beats FC** (paired t=4.94, p<0.001, reward -225 vs -272, 17% better). No RL-trained policy has matched or exceeded KNN performance. Continuous action space (Phase 11) eliminates binary bistability and enables genuine per-edge differentiation, but has not yet beaten FC in formal evaluation. V3 (sf=0.15, floor 0.2) is closest at +0.7% reward (within noise), training continuing.
-
-### Git state
-Branch `exp/autonomous-research`. Modified: `evaluate_checkpoint.py`, `train.py`, `envs/env.py`.
-
-### Experiment results on disk
-All under `/workspace/test_results/`. Key ones:
-- `scale_factor_sweep_260521/` — sf {0.01, 0.05, 0.2}. Phase 5 data.
-- `sf03_fresh_lr2e4_260522/` — sf=0.03. Converged to near-FC (Phase 6).
-- `conn_cost_sweep_260522/` — Connection cost sweep. Zero learning (Phase 7a).
-- `sf_sweep_260522/` — sf {0.07, 0.1, 0.15}. sf=0.15 learned then collapsed (Phase 7b). **Checkpoint 70 evaluated: exactly FC (19.0 edges/agent).**
-- `wctrl_sweep_260523/` — w_ctrl {0.3, 0.5, 1.0}. Entropy stuck at 263 (entropy_coeff too strong).
-- `topk10_260523/` — top-K=10 v1 (collapsed) and v2 (bias=+2.0, checkpoints at 10/20/30).
-
-### What was done in 2026-05-27 session (continuous action implementation)
-- Implemented continuous attention weights (Phase 11): env, model, distribution, eval
-- Ran 3 training variants: V1 (sf=0.15 no floor — collapsed at iter 7), V2 (sf=0.05 + floor 0.2), V3 (sf=0.15 + floor 0.2)
-- Formally evaluated V2 checkpoint 10 (100 episodes): -3.4% vs FC, 8.17 edges/agent
-- Formally evaluated V3 checkpoint 10 (100 episodes): +0.7% vs FC, 15.85 edges/agent
-- V2 and V3 continue training on GPUs 1 and 3 to 100 iterations
-- Committed implementation: `143cecc`
-
-### What has been done this session (prior)
-- **Modified `evaluate_checkpoint.py`** to support ego-centric model (`NeighborSelectionPPORLlib`). Auto-detects observation type from checkpoint params. Added mean_edges_per_agent and flocking_success metrics.
-- **Modified `envs/env.py`** to always compute `_conn_ratio` for logging, even when `w_conn=0`.
-- **Formally evaluated sf_sweep checkpoint 70** (50 episodes): exactly FC, 19.0 edges/agent, no selective behavior.
-- **Ran K-nearest diagnostic**: K=10 gets 23% less control cost than FC — confirmed selectivity IS beneficial.
-- **Ran 9 training experiments** testing w_ctrl sweep, entropy_coeff, sf values, batch sizes, lr schedules, fine-tuning from FC checkpoint, and curriculum approaches. All failed due to the bistability of the binary action space.
-- **Diagnosed the fundamental problem**: the independent binary action space with sf-scaled logits creates two strong attractors (FC and empty) with no stable intermediate. This is an architecture problem, not a reward problem.
-- **Implemented top-K action space** in `models/ppo.py`: `top_k` config parameter masks `attention_scores_to_logits()` to allow only K highest-scoring neighbors. +2.0 bias prevents empty-attractor collapse.
-- **Tested top-K=10**: FC attractor eliminated, conn stable at ~0.50 for 40 iters. But vel_ent worse than random top-K selection — credit assignment is the remaining bottleneck. Collapsed after ~48 iters when model overcame the +2.0 bias.
-- **Identified next step**: Initialize top-K from K-nearest heuristic (warm start from vel_ent=0.23) rather than learning from scratch.
-
-## Autonomous Session Protocol (`/goal`)
-
-This document drives autonomous `/goal` sessions. Each session reads HANDOFF.md, runs experiments, and updates HANDOFF.md before exiting.
-
-### Context budget
-- `cat /tmp/ctx` returns current token count. Capacity = 1,000,000.
-- **Hard stop at 400,000 tokens (40%).** Before stopping: update this document, then declare the session complete.
-- Check `cat /tmp/ctx` periodically. Do not waste context on repetitive polling — use background tasks and monitors efficiently.
-
-### Operating rules
-1. **Read HANDOFF.md first** — understand current state, what's been tried, what's next.
-2. **Delegate to sub-agents (Opus)** — all code exploration, experiment config generation, evaluation runs, and training monitoring go to sub-agents. All sub-agents must use model=opus. Main agent makes research decisions and records findings only.
-3. **Training monitoring** — do NOT poll iteration progress from the main agent. Instead, launch a sub-agent with `run_in_background=true` to monitor and report back when a target iteration is reached. Estimate iteration time from prior data (sf=0.15 with 3 trials: ~6 min/iter) and check at reasonable intervals (e.g., if 30 iters will take ~3 hours, check at 2.5h and 3h — not every 30 seconds).
-4. **Evaluate before claiming results.** Training metrics (episode_reward_mean, custom_metrics) are noisy indicators. Only formal multi-episode evaluation with deterministic actions counts as evidence. Never write "proves" or "CAN beat" in HANDOFF without eval data.
-5. **Resources** — GPUs: `cuda:1` and `cuda:3` only. CPU: max 58 Ray workers total.
-6. **Git workflow** — work on branch `exp/autonomous-research`. Commit freely (local only, never push).
-6. **Record accurately** — update Research Trajectory with factual findings. Do not overstate results. Distinguish training metrics from formal evaluation.
-7. **Graceful exit** — update this file so the next session can continue seamlessly.
-
-## Open Questions & Directions
-
-### The fundamental problem
-Every trained ego-centric policy has either:
-1. **Converged to near-FC** (selecting all neighbors) — Phase 6 confirmed this for sf=0.03
-2. **Become unstable before evaluation** — sf=0.15 collapsed at iter 32
-
-The question is whether FC is the true optimum under the current reward, or whether the training dynamics prevent discovering better strategies.
-
-### Why FC might be suboptimal
-The centralized model proved FC is suboptimal (verified with vel_ent < 1.0 convergence criterion — faster convergence and better eval reward than FC-ACS). Possible reasons:
-1. **Control cost:** With FC, each agent averages ALL neighbors including distant/misaligned ones → unnecessary turning. Selective filtering reduces this. But with w_ctrl=0.02, this benefit is negligible in training reward.
-2. **Convergence speed:** A selective policy that ignores noisy/distant neighbors may converge to alignment faster than FC, which dilutes signal with noise from all 19 neighbors.
-
-### Training dynamics lessons
-- `grad_clip` must be None. Default 1.0 kills actor learning.
-- `scale_factor`: sf ≤ 0.12 → no learning (gradient too weak); sf=0.15 → learning but bistable; sf=0.2 → immediate collapse. The narrow window (0.12–0.2) is NOT tunable — it's a symptom of the binary action space architecture.
-- `aux_enabled=True` is necessary for learning.
-- `lr` ∈ [3e-4, 5e-4] is the productive range.
-- Connection cost (global sparsity penalty) does NOT work — per-edge gradient too diluted at 1/380.
-- `entropy_coeff` ≥ 0.005 kills learning for 380-edge binary action space (bonus 1.3/sample overwhelms policy gradient). entropy_coeff=0.001 is too weak to break FC. entropy_coeff=0.01 breaks FC but causes value function mismatch when later removed.
-- **w_ctrl > 0.02 with sf=0.15 DOES incentivize selectivity** — the policy immediately moves away from FC — but it overshoots to near-empty (conn<0.1) because the binary action space has no stable intermediate state.
-- **Higher w_ctrl with sf=0.05: alignment and control cost gradients partially cancel → zero learning.** The opposing reward components make the net per-edge gradient negligible at low sf.
 
 ### Phase 8: Formal eval of checkpoint 70 + w_ctrl sweep
 **Formal eval of sf_sweep checkpoint 70** (50 episodes, deterministic, `evaluate_checkpoint.py` modified to support ego-centric model):
@@ -303,92 +216,123 @@ The top-K constraint successfully eliminates the FC/empty bistability, but the m
 
 **Core conclusion:** The per-edge credit assignment problem is structural, not fixable by initialization, biases, or hyperparameter tuning. 380 independent binary decisions with one scalar reward → PPO's gradient is noise that degrades any good policy.
 
-### Recommended next approaches (prioritized)
+### Phase 11: Continuous attention weights (2026-05-27)
 
-**The blocker is credit assignment, not architecture.** All attempts with independent binary edges + scalar reward failed because PPO can't attribute the episode reward to individual edge decisions. Solutions must address this directly.
-
-1. **Per-agent reward decomposition** — compute per-agent rewards in `compute_custom_reward()` (each agent's control cost + alignment contribution separately). Sum for the env scalar, but use per-agent values in a **custom PPO loss** (similar to the existing aux task hook). Each agent's 19 edge decisions share only that agent's advantage — 19× better credit assignment than sharing across 380 edges.
-2. **Continuous attention weights** — replace binary 0/1 with continuous [0,1] weights. The ACS controller uses `weight[i,j] * neighbor_j_heading` instead of `action[i,j] * neighbor_j_heading`. Smooth gradients everywhere; no bistability. Requires `env_transition()` modification (~20 lines).
-3. **Autoregressive neighbor selection** — select neighbors one at a time per agent, conditioning on previous selections. Use a Plackett-Luce distribution over the pointer-net scores. Each selection gets its own reward attribution. Requires custom action distribution + env wrapper.
-4. **Multi-agent RL** — treat each agent as a separate agent in RLlib's multi-agent mode. Per-agent obs, per-agent reward, per-agent policy. The action per agent is a 19-dim binary vector — much smaller than 380. The env already supports `multi_env` mode.
-
-**What's been ruled out:**
-- Architectural biases (distance, rank, top-K): all reduce to hardcoded heuristics. RL either contributes nothing or degrades.
-- BC + RL fine-tuning: sf=0.15 destroys any initialization in 1-2 iters. Lower sf → no learning.
-- Reward weight tuning (w_ctrl, w_vel, w_pos): doesn't address the credit assignment gap.
-- Hyperparameter tuning (lr, clip, batch size, entropy_coeff): exhaustively explored. No combination stabilizes the binary action space.
-
-### Phase 11: Continuous attention weights (2026-05-27, in progress)
-
-**Implementation** (envs/env.py, models/ppo.py, models/beta_dist.py):
-- Env: `continuous_action=True` in EnvConfig. Action space changes from `Box(int8)` to `Box(float32, [0,1])`. `env_transition()` uses `neighbor_masks * action` (float multiply) instead of `np.logical_and`. Weight floor at 0.2 prevents spatial fragmentation.
+**Implementation** (commit `143cecc`, files: envs/env.py, models/ppo.py, models/beta_dist.py, evaluate_checkpoint.py):
+- Env: `continuous_action=True` in EnvConfig. Action space `Box(float32, [0,1])`. `env_transition()` uses `neighbor_masks * action` (float multiply) instead of `np.logical_and`. Weight floor at 0.2 prevents spatial fragmentation.
 - Model: `attention_scores_to_logits()` outputs `[mean_logits, log_std_logits]` instead of `[-score, +score]` pairs. Mean logits = sf-scaled attention scores + 10.0 diagonal boost. Log_std = learnable global parameter (init -1.0, giving std≈0.37).
-- Distribution: `TorchContinuousWeightDist` (squashed Gaussian) — sigmoid(Normal(mean, std)). Avoids torch.distributions.Beta which triggers CUDA JIT failures on newer GPUs with CUDA 11.3. Actions reshaped to (N, N) to match action space.
-- Training: `normalize_actions=False` to prevent RLlib's default unsquashing.
+- Distribution: `TorchContinuousWeightDist` (squashed Gaussian) — sigmoid(Normal(mean, std)). Avoids torch.distributions.Beta which triggers CUDA JIT failures on RTX 6000 Ada (compute 8.9) with CUDA 11.3. Actions reshaped to (N, N) to match action space.
+- Training: `normalize_actions=False` to prevent RLlib's default unsquashing for float32 Box.
 
-**V1: sf=0.15, no floor, log_std=0** (continuous_sf15_260526, 8 iters before kill):
-- Iter 1-3: Promising — vel_ent improved 0.68→0.49, conn stable 0.49→0.67. No binary bistability.
-- Iter 5-8: Weights drifted toward 0 (conn: 0.67→0.52→0.44→0.36→0.34). Spatial fragmentation at iter 7 (sp_ent=87, reward=-4480). Killed.
-- **Root cause:** High std (exp(0)=1.0) in pre-sigmoid space creates excessive weight variance. Combined with sf=0.15, the mean logits drift negative under noisy gradients.
+**9 training variants tested (V1–V9), 4 formally evaluated:**
 
-**V2: sf=0.05, floor=0.2, log_std=-1** (continuous_sf05_floor02_260526, running):
-- Very stable: vel_ent oscillates 0.29-0.35, conn stable at 0.50-0.58, sp_ent stable at 38-40.
-- But learning is slow — vel_ent plateaued after iter 2. sf=0.05 may be too conservative for even continuous actions.
-- Running to 100 iters to see if slow learning eventually differentiates neighbor weights.
+| Variant | sf | w_ctrl | grad_clip | Outcome |
+|---------|-----|--------|-----------|---------|
+| V1 | 0.15 | 0.02 | None | Killed iter 8: weights drifted to 0, spatial fragmentation (no floor) |
+| V2 | 0.05 | 0.02 | None | NaN crash iter 25. Eval ckpt 10: **-3.4% vs FC**, 8.17 edges |
+| V3 | 0.15 | 0.02 | None | NaN crash iter ~15. Eval ckpt 10: **+0.7% vs FC** (noise), 15.85 edges |
+| V5 | 0.05 | 0.02 | 5.0 | Killed iter 7: conn stuck at 0.503 (no learning, sf+gc too conservative) |
+| V6 | 0.10 | 0.02 | 5.0 | Killed iter 7: converging to FC (conn→0.75) |
+| V7 | 0.10 | 0.1 | 5.0 | Killed iter ~16: conn drifted to floor (0.24), vel_ent degraded |
+| V8 | 0.10 | 0.2 | 5.0 | NaN crash iter 16. Best training vel_ent=0.218 before crash |
+| V9 | 0.10 | 0.2 | 1.0 | NaN at iter 28+, ckpt 30 corrupted. Eval ckpt 10: **-8.0% vs FC**, 9.99 edges. Eval ckpt 20: **-59.0% vs FC** (bad oscillation phase). Eval ckpt 30: **all NaN** |
 
-**V3: sf=0.15, floor=0.2, log_std=-1** (continuous_sf15_floor02_260527, running):
-- Hypothesis: the 0.2 weight floor prevents V1's fragmentation failure. sf=0.15's faster gradient should enable actual per-edge differentiation.
-- Running on GPU 3 in parallel with V2.
+**Formal evaluation results (all 100 episodes, deterministic):**
 
-**V2 checkpoint 10 formal eval** (100 episodes, deterministic):
-- RL: reward=-292.0±122.0, vel_ent=0.626±2.200, sp_ent=39.8, **edges/agent=8.17** (43% of FC)
-- FC: reward=-282.3±106.6, vel_ent=0.122±0.394, sp_ent=39.7, edges=19.0
-- RL -3.4% reward (WORSE), vel_ent worse. **50-episode eval showed +7.6% but was sample noise — 100-episode eval corrects to -3.4%.**
-- RL learned genuine selectivity (8.17 effective edges vs FC's 19.0) — first RL policy with real per-edge differentiation. But the selectivity is suboptimal: wrong neighbors downweighted.
+| Checkpoint | RL reward | FC reward | Diff | RL vel_ent | FC vel_ent | RL edges |
+|------------|-----------|-----------|------|------------|------------|----------|
+| V2 ckpt 10 (sf=0.05, w_ctrl=0.02) | -292.0±122.0 | -282.3±106.6 | -3.4% | 0.626±2.200 | 0.122±0.394 | 8.17 |
+| V3 ckpt 10 (sf=0.15, w_ctrl=0.02) | -274.5±94.6 | -276.3±100.9 | +0.7% | 0.195±1.103 | 0.065±0.199 | 15.85 |
+| V9 ckpt 10 (sf=0.10, w_ctrl=0.2) | -287.4±109.0 | -266.2±100.6 | -8.0% | 0.321±1.533 | 0.069±0.194 | 9.99 |
+| V9 ckpt 20 (sf=0.10, w_ctrl=0.2) | -430.4±183.3 | -270.8±95.3 | -59.0% | 4.207±6.282 | 0.124±0.632 | 11.92 |
+| V9 ckpt 30 (sf=0.10, w_ctrl=0.2) | NaN | -263.5±97.8 | — | NaN | 0.045±0.130 | NaN |
 
-**Key finding:** Continuous weights eliminate binary bistability and enable per-edge differentiation. But credit assignment remains: 400 continuous decisions with scalar reward → the policy differentiates weights but can't attribute which edges help. The structural selectivity (8.17 vs 19.0 edges) is a genuine RL contribution, but it hurts rather than helps at checkpoint 10.
+**Key findings from Phase 11:**
+1. **Binary bistability eliminated.** Continuous weights allow stable training for 15-25 iterations without FC/empty attractor collapse. The policy smoothly adjusts weights rather than snapping between extremes.
+2. **Genuine per-edge differentiation achieved.** RL policies use 8-16 effective edges/agent (vs FC's 19.0) — the first RL policies with real neighbor selectivity.
+3. **FC-ACS NOT beaten.** All evaluated checkpoints perform equal to or worse than FC. The selectivity is real but suboptimal — the policy downweights the wrong neighbors.
+4. **NaN instability.** All variants eventually crash with NaN in attention scores after 15-30 iterations. Root cause: unbounded attention score growth. Mitigations (grad_clip, mean clamp, nan_to_num) delay but don't prevent it. The nan_to_num protection keeps training "alive" but corrupts model weights.
+5. **Training oscillation.** The policy oscillates between selective (conn=0.3-0.5, high vel_ent) and FC-like (conn=0.7-0.9, low vel_ent) phases. Checkpoints from different phases have wildly different eval quality (-59% to +0.7% vs FC).
+6. **Reward mismatch.** Training with w_ctrl>0.02 optimizes for a shaped reward (selectivity bonus), but eval uses pure control cost (no w_ctrl). V9 optimized for low connectivity but this doesn't help under the eval metric.
+7. **Credit assignment remains unsolved.** 400 continuous decisions with one scalar reward → the policy adjusts weights globally (all up or all down) rather than per-edge. Same fundamental problem as binary, expressed differently.
 
-**V3 checkpoint 10 formal eval** (100 episodes, deterministic):
-- RL: reward=-274.5±94.6, vel_ent=0.195±1.103, sp_ent=39.6, **edges/agent=15.85** (83% of FC)
-- FC: reward=-276.3±100.9, vel_ent=0.065±0.199, sp_ent=39.7, edges=19.0
-- RL +0.7% reward (essentially equal). V3 is less selective than V2 (15.85 vs 8.17 edges) but closer to FC performance.
-
-**Summary of continuous action space experiments (as of iter ~20):**
-- Continuous weights successfully eliminate binary bistability. Policy learns stably for 20+ iterations without collapsing to FC or empty.
-- Both V2 (sf=0.05) and V3 (sf=0.15) learn genuine per-edge differentiation (conn < 1.0).
-- Neither has beaten FC-ACS in formal evaluation. V2 is 3.4% worse; V3 is 0.7% better (within noise).
-- The per-edge credit assignment problem persists: 400 continuous decisions with one scalar reward → noisy gradient doesn't reliably identify which neighbors to downweight.
-- Training continues on both GPUs. Later checkpoints (50-100 iters) may show improvement as the policy gradually refines its neighbor weighting.
-
-**Remaining challenge:** The credit assignment problem limits per-edge learning regardless of action space type (binary or continuous). Continuous weights provide smoother gradients and eliminate bistability, but can't overcome the fundamental issue of attributing a scalar reward to 400 individual edge decisions. Per-agent reward decomposition remains the most promising next step.
-
-**V5/V6 (w_ctrl=0.02, NaN fix):** V5 (sf=0.05) showed zero weight learning (conn stuck at 0.503 due to grad_clip+sf being too conservative). V6 (sf=0.10) converged toward FC (conn→0.75 by iter 7). Killed both — w_ctrl=0.02 provides no selectivity incentive.
-
-**V7 (w_ctrl=0.1, sf=0.10):** conn steadily decreased 0.50→0.24 over 10 iters. vel_ent worsened 0.29→0.98. Same overshoot toward empty as binary but in slow motion — the floor at 0.2 prevents collapse but the policy keeps pushing toward minimum weight.
-
-**V8 (w_ctrl=0.2, sf=0.10):** conn dipped to 0.37 then recovered to 0.62 by iter 10. vel_ent: 0.29→1.39→0.56. The stronger w_ctrl caused initial overshoot but alignment loss pulled it back. Shows oscillatory dynamics around a balance point but hasn't converged.
-
-**Session conclusion:** Continuous attention weights eliminate binary bistability and enable smooth gradient-based exploration of the weight space. However, the per-edge credit assignment problem remains the fundamental bottleneck. With 400 continuous decisions and one scalar reward, the policy cannot reliably determine which specific neighbors to up/downweight. It oscillates between global weight adjustments (all up or all down) without per-edge discrimination.
-
-**V9 (w_ctrl=0.2, sf=0.10, grad_clip=1.0) checkpoint 10 formal eval** (100 episodes):
-- RL: reward=-287.4±109.0, vel_ent=0.321±1.533, **edges/agent=9.99** (53% of FC)
-- FC: reward=-266.2±100.6, vel_ent=0.069±0.194, edges=19.0
-- RL **-8.0% reward (WORSE)**. Uses half the edges but gets worse alignment AND higher control cost.
-- **Reward mismatch**: training w_ctrl=0.2 penalizes connectivity, but eval uses pure control cost (no w_ctrl). The policy optimized for selectivity under a training reward that doesn't match the eval metric.
+## Current State (2026-05-27)
 
 ### Running experiments
-V9 (GPU 3, w_ctrl=0.2, grad_clip=1.0) running to 100 iterations.
+None. All training killed.
 
-### Conclusion on continuous attention weights
-Continuous weights solve bistability but NOT credit assignment. All evaluated checkpoints are worse than or equal to FC-ACS:
-- V2 ckpt 10 (w_ctrl=0.02, sf=0.05): -3.4% vs FC, 8.17 edges
-- V3 ckpt 10 (w_ctrl=0.02, sf=0.15): +0.7% vs FC (noise), 15.85 edges
-- V9 ckpt 10 (w_ctrl=0.2, sf=0.10): -8.0% vs FC, 9.99 edges
-- V9 ckpt 20 (w_ctrl=0.2, sf=0.10): -59.0% vs FC, 11.92 edges (oscillation)
-- V9 ckpt 30: **all NaN** — model weights corrupted despite nan_to_num training protection
+### FC-ACS has NOT been beaten by RL
+**K=10 nearest heuristic beats FC** (paired t=4.94, p<0.001, reward -225 vs -272, 17% better). No RL-trained policy has matched or exceeded KNN performance. Binary action space has bistability (Phases 5-10). Continuous action space (Phase 11) eliminates bistability but per-edge credit assignment remains unsolved.
 
-Training dynamics: the policy oscillates between selective (conn=0.3-0.5, high vel_ent) and FC-like (conn=0.7-0.9, low vel_ent) phases without converging to a stable intermediate. Checkpoints from different phases have wildly different eval quality.
+### Git state
+Branch `exp/autonomous-research`. Latest commit: `c74e308`.
+New files this session: `models/beta_dist.py`, `train_v3.py`, `run_eval.sh`.
+Modified: `envs/env.py`, `models/ppo.py`, `evaluate_checkpoint.py`, `train.py`.
 
-**NaN stability**: required grad_clip (5.0→1.0) + nan_to_num in distribution + mean clamp [-20,20]. Even with sf=0.05, models crashed at iter 25 without these protections.
+### Experiment results on disk
+All under `/workspace/test_results/`. Key ones from prior sessions:
+- `scale_factor_sweep_260521/` — sf {0.01, 0.05, 0.2}. Phase 5 data.
+- `sf03_fresh_lr2e4_260522/` — sf=0.03. Converged to near-FC (Phase 6).
+- `conn_cost_sweep_260522/` — Connection cost sweep. Zero learning (Phase 7a).
+- `sf_sweep_260522/` — sf {0.07, 0.1, 0.15}. sf=0.15 learned then collapsed (Phase 7b). **Checkpoint 70 evaluated: exactly FC (19.0 edges/agent).**
+- `wctrl_sweep_260523/` — w_ctrl {0.3, 0.5, 1.0}. Entropy stuck at 263 (entropy_coeff too strong).
+- `topk10_260523/` — top-K=10 v1 (collapsed) and v2 (bias=+2.0, checkpoints at 10/20/30).
 
-The next approach should be **per-agent reward decomposition** — the only approach that addresses the fundamental credit assignment bottleneck (400 decisions, 1 scalar reward).
+Key ones from this session (Phase 11):
+- `continuous_sf15_260526/` — V1: sf=0.15, no floor. Killed iter 8 (fragmentation).
+- `continuous_sf05_floor02_260526/` — V2 (first trial, NaN crash iter 25) + V5 (second trial, killed iter 7). V2 ckpt 10 evaluated.
+- `continuous_sf15_floor02_260527/` — V3: sf=0.15, floor 0.2. NaN crash iter ~15. V3 ckpt 10 evaluated.
+- `continuous_sf10_floor02_260527/` — V6: sf=0.10, floor 0.2, grad_clip=5.0. Killed iter 7 (converging to FC).
+- `continuous_sf10_wctrl01_260527/` — V7: sf=0.10, w_ctrl=0.1, grad_clip=5.0. Killed iter ~16.
+- `continuous_sf10_wctrl02_260527/` — V8: sf=0.10, w_ctrl=0.2, grad_clip=5.0. NaN crash iter 16.
+- `continuous_sf10_wctrl02_gc1_260527/` — V9: sf=0.10, w_ctrl=0.2, grad_clip=1.0. NaN iter 28+, ckpt 30 corrupted. 3 checkpoints evaluated.
+
+### What was done in 2026-05-27 session
+- Implemented continuous attention weights: env (`continuous_action` flag), model (sigmoid mean + learnable log_std), distribution (`TorchContinuousWeightDist`), eval (sigmoid inference, continuous FC baseline).
+- Addressed RLlib integration issues: action shape mismatch (reshape in distribution), read-only action arrays (copy in env), unsquash bypass (`normalize_actions=False`), CUDA JIT failure (squashed Gaussian instead of Beta).
+- Ran 9 training variants (V1–V9) exploring sf ∈ {0.05, 0.10, 0.15}, w_ctrl ∈ {0.02, 0.1, 0.2}, grad_clip ∈ {None, 1.0, 5.0}, with/without weight floor.
+- Formally evaluated 4 checkpoints (100 episodes each). None beat FC-ACS.
+- Discovered and mitigated NaN instability (grad_clip, mean clamp, nan_to_num) — delays but doesn't prevent crash.
+- Commits: `143cecc` (implementation), `fa95f15` (NaN fix v1), `d57d9fe` (NaN fix v2), plus 4 HANDOFF update commits.
+
+### Training dynamics lessons (continuous actions)
+- **NaN instability:** All continuous runs eventually produce NaN in attention scores (iter 15-30). grad_clip=1.0 delays it but doesn't prevent it. Root cause is unbounded attention score growth in the transformer; needs architectural fix (e.g., attention score normalization) rather than gradient clipping.
+- **Weight floor (0.2):** Successfully prevents spatial fragmentation that killed V1. But the floor creates a hard boundary that the policy pushes against rather than finding an intermediate.
+- **w_ctrl=0.02:** Too weak — no selectivity incentive; policy converges to FC.
+- **w_ctrl=0.1-0.2:** Creates selectivity pressure but policy overshoots (conn drifts to floor) or oscillates without converging.
+- **grad_clip=None:** NaN crash. grad_clip=5.0: too conservative with sf=0.05 (no learning). grad_clip=1.0: slows the binary actor (Phase 3) but acceptable for continuous.
+
+## Recommended next approaches (prioritized)
+
+**The blocker is credit assignment, not architecture.** All attempts with independent per-edge decisions (binary or continuous) + scalar reward fail because PPO can't attribute the episode reward to individual edge decisions.
+
+1. **Per-agent reward decomposition** — compute per-agent rewards in `compute_custom_reward()` (each agent's control cost + alignment contribution separately). Sum for the env scalar, but use per-agent values in a **custom PPO loss** (similar to the existing aux task hook). Each agent's 19 edge decisions share only that agent's advantage — 19× better credit assignment than sharing across 380 edges.
+2. **Autoregressive neighbor selection** — select neighbors one at a time per agent, conditioning on previous selections. Use a Plackett-Luce distribution over the pointer-net scores. Each selection gets its own reward attribution. Requires custom action distribution + env wrapper.
+3. **Multi-agent RL** — treat each agent as a separate agent in RLlib's multi-agent mode. Per-agent obs, per-agent reward, per-agent policy. The action per agent is a 19-dim binary vector — much smaller than 380. The env already supports `multi_env` mode.
+
+**What's been ruled out:**
+- Binary action space: bistable (FC/empty attractors), no stable intermediate (Phases 5-10).
+- Continuous action space alone: eliminates bistability but doesn't solve credit assignment. Policy oscillates, NaN instability, no checkpoint beats FC (Phase 11).
+- Architectural biases (distance, rank, top-K): all reduce to hardcoded heuristics. RL either contributes nothing or degrades (Phase 10).
+- BC + RL fine-tuning: sf=0.15 destroys any initialization in 1-2 iters. Lower sf → no learning (Phase 10).
+- Reward weight tuning (w_ctrl, w_vel, w_pos): doesn't address the credit assignment gap (Phases 7-8, 11).
+- Hyperparameter tuning (lr, clip, batch size, entropy_coeff): exhaustively explored. No combination solves the fundamental issue.
+
+## Autonomous Session Protocol (`/goal`)
+
+This document drives autonomous `/goal` sessions. Each session reads HANDOFF.md, runs experiments, and updates HANDOFF.md before exiting.
+
+### Context budget
+- `cat /tmp/ctx` returns current token count. Capacity = 1,000,000.
+- **Hard stop at 400,000 tokens (40%).** Before stopping: update this document, then declare the session complete.
+- Check `cat /tmp/ctx` periodically. Do not waste context on repetitive polling — use background tasks and monitors efficiently.
+
+### Operating rules
+1. **Read HANDOFF.md first** — understand current state, what's been tried, what's next.
+2. **Delegate to sub-agents (Opus)** — all code exploration, experiment config generation, evaluation runs, and training monitoring go to sub-agents. All sub-agents must use model=opus. Main agent makes research decisions and records findings only.
+3. **Training monitoring** — do NOT poll iteration progress from the main agent. Instead, launch a sub-agent with `run_in_background=true` to monitor and report back when a target iteration is reached. Estimate iteration time from prior data (sf=0.15 with 3 trials: ~6 min/iter) and check at reasonable intervals (e.g., if 30 iters will take ~3 hours, check at 2.5h and 3h — not every 30 seconds).
+4. **Evaluate before claiming results.** Training metrics (episode_reward_mean, custom_metrics) are noisy indicators. Only formal multi-episode evaluation with deterministic actions counts as evidence. Never write "proves" or "CAN beat" in HANDOFF without eval data.
+5. **Resources** — GPUs: `cuda:1` and `cuda:3` only. CPU: max 58 Ray workers total.
+6. **Git workflow** — work on branch `exp/autonomous-research`. Commit freely (local only, never push).
+6. **Record accurately** — update Research Trajectory with factual findings. Do not overstate results. Distinguish training metrics from formal evaluation.
+7. **Graceful exit** — update this file so the next session can continue seamlessly.
