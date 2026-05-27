@@ -57,6 +57,9 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             self.top_k = cfg["top_k"] if "top_k" in cfg else None
             self.distance_bias_scale = cfg["distance_bias_scale"] if "distance_bias_scale" in cfg else 0.0
             self.continuous_action = cfg.get("continuous_action", False)
+            self.per_agent_credit = cfg.get("per_agent_credit", False)
+            self.pa_credit_alpha = cfg.get("pa_credit_alpha", 1.0)
+            self.pa_replace_ppo = cfg.get("pa_replace_ppo", False)
             self._pretrained_weights_path = cfg.get("pretrained_weights_path", None)
             self.aux_enabled = cfg["aux_enabled"] if "aux_enabled" in cfg else False
             self.aux_loss_coef = cfg["aux_loss_coef"] if "aux_loss_coef" in cfg else 0.1
@@ -251,6 +254,7 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             self._distance_bias = self.distance_bias_scale * (K - 0.5 - ranks)
 
         x = self.attention_scores_to_logits(att)  # (batch_size, num_agents_max * num_agents_max * 2)
+        self._cached_logits = x
 
         if self.share_layers:
             self.values = h_c_N.squeeze(1)                      # (batch_size, d_embed_context)
@@ -341,45 +345,132 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
         denom = (mask.sum() * T).clamp(min=1.0)
         return ((pred - target_b) ** 2 * mask).sum() / denom
 
-    def custom_loss(self, policy_loss, loss_inputs):
-        """
-        Auxiliary self-supervised regression on actor (and optionally critic) encoder.
+    def _compute_per_agent_logp(self, logits, actions, padding_mask):
+        """Compute per-agent log-probs for continuous action space.
 
-        Actor aux: encoder per-pair embedding (or context vector) predicts flock-center state.
-        Critic aux (share_layers=False only): same task on the critic's separate encoder.
+        Returns (B, N) tensor where entry [b, i] = sum_j log p(a_{ij}).
+        """
+        import math
+        N = self._num_agents_max
+        mean_logits = logits[:, :N*N].reshape(-1, N, N)
+        log_std = logits[:, N*N:].reshape(-1, N, N)
+        std = torch.exp(log_std.clamp(-5.0, 2.0))
+        actions_2d = actions.reshape(-1, N, N)
+
+        x = actions_2d.clamp(1e-6, 1.0 - 1e-6)
+        z = torch.log(x / (1.0 - x))
+        normal_logp = (-0.5 * ((z - mean_logits) / std).pow(2)
+                       - 0.5 * math.log(2.0 * math.pi)
+                       - torch.log(std))
+        correction = torch.log(x * (1.0 - x) + 1e-8)
+        per_element_logp = normal_logp - correction  # (B, N, N)
+
+        edge_mask = padding_mask.unsqueeze(2) * padding_mask.unsqueeze(1)
+        return (per_element_logp * edge_mask).sum(-1)  # (B, N)
+
+    def custom_loss(self, policy_loss, loss_inputs):
+        """Per-agent credit assignment (additive) + auxiliary self-supervised regression.
+
+        When per_agent_credit is enabled, adds a per-agent correction term to the
+        standard PPO loss. The correction redistributes gradient among agents
+        proportional to their per-agent reward deviation from mean. The standard
+        PPO loss (with clipping, VF, entropy) is preserved for stability.
 
         RLlib v2.1.0 contract: policy_loss arrives as a list (PPO: length 1);
         return a list of the same length.
         """
-        if not self.aux_enabled:
-            return policy_loss
-
-        target = self._aux_target
-        pad = self._aux_padding_mask
-        nm = self._aux_neighbor_masks
-
-        # Actor aux
-        aux_actor = self._compute_aux_mse(self.aux_branch, self._aux_features, target, pad, nm)
-        total_aux = self.aux_loss_coef * aux_actor
-        self._last_aux_loss = aux_actor.detach()
-
-        # Critic aux (only when separate encoder exists and coef > 0)
+        # --- Aux loss (always computed when enabled) ---
+        total_aux = torch.tensor(0.0, device=policy_loss[0].device) if isinstance(policy_loss[0], torch.Tensor) else 0.0
+        self._last_aux_loss = None
         self._last_aux_loss_critic = None
-        if (not self.share_layers and self.aux_loss_coef_critic > 0
-                and self._aux_features_critic is not None):
-            aux_critic = self._compute_aux_mse(
-                self.aux_branch_critic, self._aux_features_critic, target, pad, nm)
-            total_aux = total_aux + self.aux_loss_coef_critic * aux_critic
-            self._last_aux_loss_critic = aux_critic.detach()
+        self._last_pa_pg_loss = None
 
-        return [pl + total_aux for pl in policy_loss]
+        if self.aux_enabled and hasattr(self, '_aux_target'):
+            target = self._aux_target
+            pad = self._aux_padding_mask
+            nm = self._aux_neighbor_masks
+
+            aux_actor = self._compute_aux_mse(self.aux_branch, self._aux_features, target, pad, nm)
+            total_aux = self.aux_loss_coef * aux_actor
+            self._last_aux_loss = aux_actor.detach()
+
+            if (not self.share_layers and self.aux_loss_coef_critic > 0
+                    and self._aux_features_critic is not None):
+                aux_critic = self._compute_aux_mse(
+                    self.aux_branch_critic, self._aux_features_critic, target, pad, nm)
+                total_aux = total_aux + self.aux_loss_coef_critic * aux_critic
+                self._last_aux_loss_critic = aux_critic.detach()
+
+        # --- Per-agent credit assignment ---
+        pa_loss = torch.tensor(0.0, device=policy_loss[0].device)
+        if (self.per_agent_credit and self.continuous_action
+                and "per_agent_rewards" in loss_inputs
+                and hasattr(self, '_cached_logits')):
+
+            per_agent_rew = loss_inputs["per_agent_rewards"]  # (B, N_max)
+            if not isinstance(per_agent_rew, torch.Tensor):
+                per_agent_rew = torch.as_tensor(per_agent_rew, dtype=torch.float32,
+                                                device=policy_loss[0].device)
+
+            padding_mask = self._aux_padding_mask  # (B, N_max), float
+            N = self._num_agents_max
+            num_real = padding_mask.sum(-1, keepdim=True).clamp(min=1.0)
+
+            # Per-agent reward deviation: zero-mean, unit-std within each timestep
+            mean_rew = (per_agent_rew * padding_mask).sum(-1, keepdim=True) / num_real
+            dev = (per_agent_rew - mean_rew) * padding_mask
+            dev_std = ((dev ** 2).sum(-1, keepdim=True) / num_real).sqrt().clamp(min=1e-8)
+            dev_norm = dev / dev_std  # (B, N), zero-mean unit-std
+
+            # Per-agent log-probs from current forward pass
+            new_logits = self._cached_logits  # (B, 2*N*N)
+            actions = loss_inputs["actions"]
+            if not isinstance(actions, torch.Tensor):
+                actions = torch.as_tensor(actions, dtype=torch.float32,
+                                          device=policy_loss[0].device)
+            per_agent_logp = self._compute_per_agent_logp(new_logits, actions, padding_mask)
+
+            if self.pa_replace_ppo:
+                # REPLACEMENT mode: per-agent REINFORCE replaces PPO surrogate
+                global_adv = loss_inputs["advantages"]
+                if not isinstance(global_adv, torch.Tensor):
+                    global_adv = torch.as_tensor(global_adv, dtype=torch.float32,
+                                                 device=policy_loss[0].device)
+                per_agent_adv = global_adv.unsqueeze(-1) * (1.0 + self.pa_credit_alpha * dev_norm)
+                per_agent_adv = per_agent_adv * padding_mask
+                valid = padding_mask.bool()
+                all_adv = per_agent_adv[valid]
+                if all_adv.numel() > 1:
+                    per_agent_adv = (per_agent_adv - all_adv.mean()) / all_adv.std().clamp(min=1e-8) * padding_mask
+
+                pa_pg = -(per_agent_adv.detach() * per_agent_logp * padding_mask).sum(-1).mean()
+                vf_pred = self.value_function()
+                value_targets = loss_inputs["value_targets"]
+                if not isinstance(value_targets, torch.Tensor):
+                    value_targets = torch.as_tensor(value_targets, dtype=torch.float32,
+                                                    device=vf_pred.device)
+                vf_loss = 0.5 * (vf_pred - value_targets).pow(2).mean()
+
+                self._last_pa_pg_loss = pa_pg.detach()
+                return [pa_pg + vf_loss + total_aux]
+            else:
+                # ADDITIVE mode: per-agent correction added to standard PPO
+                per_agent_logp_norm = per_agent_logp / num_real
+                pa_loss = -(dev_norm.detach() * per_agent_logp_norm * padding_mask).sum(-1).mean()
+                self._last_pa_pg_loss = pa_loss.detach()
+
+        # Combine: standard PPO + aux + per-agent correction
+        pa_coeff = self.pa_credit_alpha
+        return [pl + total_aux + pa_coeff * pa_loss for pl in policy_loss]
 
     def metrics(self):
-        if not self.aux_enabled or self._last_aux_loss is None:
-            return {}
-        d = {"aux_mse": float(self._last_aux_loss)}
-        if self._last_aux_loss_critic is not None:
-            d["aux_mse_critic"] = float(self._last_aux_loss_critic)
+        d = {}
+        if self.aux_enabled and self._last_aux_loss is not None:
+            d["aux_mse"] = float(self._last_aux_loss)
+            if self._last_aux_loss_critic is not None:
+                d["aux_mse_critic"] = float(self._last_aux_loss_critic)
+        if hasattr(self, '_last_pa_pg_loss') and self._last_pa_pg_loss is not None:
+            d["pa_pg_loss"] = float(self._last_pa_pg_loss)
         return d
 
 

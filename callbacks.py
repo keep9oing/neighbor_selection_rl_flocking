@@ -1,4 +1,6 @@
+import numpy as np
 from ray.rllib.algorithms.callbacks import DefaultCallbacks
+from ray.rllib.policy.sample_batch import SampleBatch
 
 
 class FlockingCallbacks(DefaultCallbacks):
@@ -26,3 +28,17 @@ class FlockingCallbacks(DefaultCallbacks):
         except Exception:
             pass
         episode.custom_metrics["flocking_success"] = float(episode.length < max_steps)
+
+    def on_postprocess_trajectory(self, *, worker, episode, agent_id,
+                                  policy_id, policies, postprocessed_batch,
+                                  original_batches, **kwargs):
+        infos = postprocessed_batch[SampleBatch.INFOS]
+        first_par = infos[0].get("per_agent_rewards") if len(infos) > 0 else None
+        if first_par is not None:
+            N = len(first_par)
+            per_agent_rewards = np.array(
+                [info.get("per_agent_rewards", np.zeros(N, dtype=np.float32))
+                 for info in infos],
+                dtype=np.float32,
+            )
+            postprocessed_batch["per_agent_rewards"] = per_agent_rewards

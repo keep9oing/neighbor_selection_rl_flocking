@@ -502,6 +502,7 @@ class NeighborSelectionFlockingEnv(gym.Env):
             "original_reward": _reward,
             "comm_loss_agents": comm_loss_agents,
             "conn_ratio": getattr(self, '_conn_ratio', None),
+            "per_agent_rewards": rewards.copy(),
         }
         info = self.get_extra_info(info, next_state, next_rel_state, control_inputs, rewards, done)
         if self.config.env.get_state_hist:

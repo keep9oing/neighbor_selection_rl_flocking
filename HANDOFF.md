@@ -256,18 +256,55 @@ The top-K constraint successfully eliminates the FC/empty bistability, but the m
 6. **Reward mismatch.** Training with w_ctrl>0.02 optimizes for a shaped reward (selectivity bonus), but eval uses pure control cost (no w_ctrl). V9 optimized for low connectivity but this doesn't help under the eval metric.
 7. **Credit assignment remains unsolved.** 400 continuous decisions with one scalar reward → the policy adjusts weights globally (all up or all down) rather than per-edge. Same fundamental problem as binary, expressed differently.
 
+### Phase 12: Per-agent reward decomposition (2026-05-27)
+
+**Implementation** (envs/env.py, callbacks.py, models/ppo.py, train_peragent.py):
+- Env: exposed per-agent rewards (from `_compute_rewards()`, shape `(N_max,)`) in info dict at each step.
+- Callbacks: `on_postprocess_trajectory()` extracts per-agent rewards from info dicts into SampleBatch column `per_agent_rewards`.
+- Model: `custom_loss()` computes per-agent reward deviation `dev_i = (r_i - mean(r)) / std(r)` within each timestep. Two modes:
+  - **Additive**: PPO loss + α × correction term `-(dev_i × logp_i)` per agent.
+  - **Replacement**: per-agent REINFORCE replaces PPO surrogate. Per-agent advantage = `A_global × (1 + α × dev_i)`.
+- `_compute_per_agent_logp()` decomposes continuous action log-probs into per-agent blocks.
+
+**V1 (REINFORCE replacement, sgd_iter=5, entropy_coeff=0, w_ctrl=0.02 and 0.1):**
+- Entropy collapsed to negative by iter 3-4 (143→101→46→-15 for w_ctrl=0.02). Without PPO clipping or entropy bonus, the REINFORCE gradient drives the policy deterministic in 2-3 iterations.
+- Before collapse (iter 2): conn=0.349 (~7 edges/agent), vel_ent=0.155 — genuinely selective with good alignment. Promising direction destroyed by instability.
+
+**V2 (Additive correction, α=0.5, sgd_iter=5, entropy_coeff=0.001):**
+- Entropy stable (143→167 at iter 3). PPO clipping prevents collapse.
+- But conn drifted toward FC: 0.50→0.64→0.59. The additive correction is too weak relative to the PPO gradient.
+
+**V3a (Additive, α=5.0, w_ctrl=0.1):**
+- Entropy dropped fast (144→92 in 2 iters). Stronger correction destabilizes without fully replacing PPO.
+
+**V3b (REINFORCE replacement, sgd_iter=1, entropy_coeff=0.01, α=1.0, w_ctrl=0.1):**
+- Most stable variant. Entropy declined steadily: 163→155→148→136→125→114→104→96→88→79.
+- Conn converged toward FC: 0.50→0.69→0.79→0.76→0.70→0.71→0.70→0.73→0.74→0.78.
+- **Formal eval of checkpoint 10 (100 episodes, deterministic):**
+  - RL: reward=-273.4±108.5, vel_ent=0.424±2.10, edges=**19.0±0.0** (exactly FC)
+  - FC: reward=-293.0±111.7, vel_ent=0.400±1.52, edges=19.0
+  - Diff: +6.7% (within noise). **Policy converged to FC.**
+
+**Key findings from Phase 12:**
+1. **Per-agent credit decomposition eliminates agent-level credit noise but doesn't solve the edge-level problem.** The per-agent reward deviation `dev_i` distinguishes agents with high/low control costs, but within each agent, the 19 edge decisions still share one scalar per-agent reward. The gradient doesn't know WHICH neighbors to select — only that the agent should change SOMETHING.
+2. **Per-step per-agent rewards all favor FC.** More connections → better alignment → less turning → lower per-agent control cost at each step. The per-agent deviation `dev_i` identifies which agents turned more, but the gradient pushes them to add MORE connections (which reduces turning), converging to FC.
+3. **The selectivity benefit is temporal, not instantaneous.** K=10 beats FC over 1000 steps because the cumulative cost of FC's minor over-steering exceeds the alignment benefit. But at each individual step, FC is locally optimal. Per-agent reward decomposition operates per-step and thus cannot capture this temporal dynamic.
+4. **Two orthogonal credit assignment dimensions:** (a) agent-level (which agent's decisions were good/bad?) — addressed by per-agent decomposition; (b) temporal (which timesteps' decisions led to good/bad outcomes?) — addressed by GAE/value function but overwhelmed by noise. Both dimensions must be solved simultaneously.
+5. **REINFORCE instability without PPO.** Replacing PPO's surrogate with REINFORCE (no importance sampling, no clipping) causes entropy collapse in 2-3 iterations with sgd_iter=5. Reducing to sgd_iter=1 with entropy bonus stabilizes training but reduces sample efficiency, and the policy still converges to FC.
+
 ## Current State (2026-05-27)
 
 ### Running experiments
 None. All training killed.
 
 ### FC-ACS has NOT been beaten by RL
-**K=10 nearest heuristic beats FC** (paired t=4.94, p<0.001, reward -225 vs -272, 17% better). No RL-trained policy has matched or exceeded KNN performance. Binary action space has bistability (Phases 5-10). Continuous action space (Phase 11) eliminates bistability but per-edge credit assignment remains unsolved.
+**K=10 nearest heuristic beats FC** (paired t=4.94, p<0.001, reward -225 vs -272, 17% better). No RL-trained policy has matched or exceeded KNN performance. Binary action space has bistability (Phases 5-10). Continuous action space (Phase 11) eliminates bistability but per-edge credit assignment remains unsolved. Per-agent reward decomposition (Phase 12) addresses agent-level credit but the per-step reward signal still pushes toward FC.
 
 ### Git state
 Branch `exp/autonomous-research`. Latest commit: `c74e308`.
-New files this session: `models/beta_dist.py`, `train_v3.py`, `run_eval.sh`.
-Modified: `envs/env.py`, `models/ppo.py`, `evaluate_checkpoint.py`, `train.py`.
+New files from prior sessions: `models/beta_dist.py`, `train_v3.py`, `run_eval.sh`.
+New files this session: `train_peragent.py`.
+Modified this session: `envs/env.py` (per_agent_rewards in info), `models/ppo.py` (per-agent credit in custom_loss), `callbacks.py` (on_postprocess_trajectory).
 
 ### Experiment results on disk
 All under `/workspace/test_results/`. Key ones from prior sessions:
@@ -278,7 +315,12 @@ All under `/workspace/test_results/`. Key ones from prior sessions:
 - `wctrl_sweep_260523/` — w_ctrl {0.3, 0.5, 1.0}. Entropy stuck at 263 (entropy_coeff too strong).
 - `topk10_260523/` — top-K=10 v1 (collapsed) and v2 (bias=+2.0, checkpoints at 10/20/30).
 
-Key ones from this session (Phase 11):
+Key ones from Phase 12 (per-agent credit):
+- `peragent_wctrl0.02_260527/` — V1 REINFORCE replacement: entropy collapsed iter 3. Killed iter 4.
+- `peragent_wctrl0.10_260527/` — V1 REINFORCE replacement: entropy collapsed iter 3. Killed iter 4.
+- `peragent_v3_replace_a1.0_wctrl0.10_260527/` — V3b most stable (sgd=1, ent=0.01): converged to FC. **Ckpt 10 evaluated: 19.0 edges, +6.7% vs FC (noise).**
+
+Key ones from Phase 11 (continuous actions):
 - `continuous_sf15_260526/` — V1: sf=0.15, no floor. Killed iter 8 (fragmentation).
 - `continuous_sf05_floor02_260526/` — V2 (first trial, NaN crash iter 25) + V5 (second trial, killed iter 7). V2 ckpt 10 evaluated.
 - `continuous_sf15_floor02_260527/` — V3: sf=0.15, floor 0.2. NaN crash iter ~15. V3 ckpt 10 evaluated.
@@ -287,13 +329,18 @@ Key ones from this session (Phase 11):
 - `continuous_sf10_wctrl02_260527/` — V8: sf=0.10, w_ctrl=0.2, grad_clip=5.0. NaN crash iter 16.
 - `continuous_sf10_wctrl02_gc1_260527/` — V9: sf=0.10, w_ctrl=0.2, grad_clip=1.0. NaN iter 28+, ckpt 30 corrupted. 3 checkpoints evaluated.
 
-### What was done in 2026-05-27 session
+### What was done in 2026-05-27 sessions
+**Session 1 (Phase 11 — continuous actions):**
 - Implemented continuous attention weights: env (`continuous_action` flag), model (sigmoid mean + learnable log_std), distribution (`TorchContinuousWeightDist`), eval (sigmoid inference, continuous FC baseline).
-- Addressed RLlib integration issues: action shape mismatch (reshape in distribution), read-only action arrays (copy in env), unsquash bypass (`normalize_actions=False`), CUDA JIT failure (squashed Gaussian instead of Beta).
-- Ran 9 training variants (V1–V9) exploring sf ∈ {0.05, 0.10, 0.15}, w_ctrl ∈ {0.02, 0.1, 0.2}, grad_clip ∈ {None, 1.0, 5.0}, with/without weight floor.
-- Formally evaluated 4 checkpoints (100 episodes each). None beat FC-ACS.
-- Discovered and mitigated NaN instability (grad_clip, mean clamp, nan_to_num) — delays but doesn't prevent crash.
+- Ran 9 training variants (V1–V9) exploring sf ∈ {0.05, 0.10, 0.15}, w_ctrl ∈ {0.02, 0.1, 0.2}, grad_clip ∈ {None, 1.0, 5.0}. Formally evaluated 4 checkpoints (100 episodes each). None beat FC-ACS.
 - Commits: `143cecc` (implementation), `fa95f15` (NaN fix v1), `d57d9fe` (NaN fix v2), plus 4 HANDOFF update commits.
+
+**Session 2 (Phase 12 — per-agent credit):**
+- Exposed per-agent rewards in env info dict. Added `on_postprocess_trajectory` callback to store per-agent rewards in SampleBatch.
+- Implemented per-agent credit assignment in `custom_loss()`: two modes (additive correction to PPO, REINFORCE replacement). Per-agent reward deviation weights per-agent log-prob blocks.
+- Tested 6 variants across V1-V3: REINFORCE replacement (entropy collapse in 2-3 iters), additive correction (too weak, conn drifts to FC), hybrid REINFORCE+entropy (stable but converges to FC).
+- Formally evaluated V3b checkpoint 10 (100 episodes): 19.0 edges/agent (FC), +6.7% reward (noise).
+- New files: `train_peragent.py`. Modified: `envs/env.py`, `models/ppo.py`, `callbacks.py`.
 
 ### Training dynamics lessons (continuous actions)
 - **NaN instability:** All continuous runs eventually produce NaN in attention scores (iter 15-30). grad_clip=1.0 delays it but doesn't prevent it. Root cause is unbounded attention score growth in the transformer; needs architectural fix (e.g., attention score normalization) rather than gradient clipping.
@@ -304,15 +351,16 @@ Key ones from this session (Phase 11):
 
 ## Recommended next approaches (prioritized)
 
-**The blocker is credit assignment, not architecture.** All attempts with independent per-edge decisions (binary or continuous) + scalar reward fail because PPO can't attribute the episode reward to individual edge decisions.
+**The blocker has two dimensions: (1) edge-level credit assignment and (2) temporal credit.** Per-step rewards favor FC at every timestep — the selectivity benefit only appears over 1000+ cumulative steps. Per-agent decomposition (Phase 12) solves neither: it distinguishes agents but not edges, and operates per-step so can't capture the temporal selectivity benefit.
 
-1. **Per-agent reward decomposition** — compute per-agent rewards in `compute_custom_reward()` (each agent's control cost + alignment contribution separately). Sum for the env scalar, but use per-agent values in a **custom PPO loss** (similar to the existing aux task hook). Each agent's 19 edge decisions share only that agent's advantage — 19× better credit assignment than sharing across 380 edges.
+1. **Multi-agent RL** (highest priority) — treat each agent as a separate agent in RLlib's multi-agent mode. Per-agent obs, per-agent reward, per-agent policy. The action per agent is a 19-dim binary/continuous vector — much smaller than 380. The env already supports `multi_env` mode. Each agent's smaller action space makes credit assignment tractable. Combined with per-agent rewards (already implemented in Phase 12), this gives each agent its own value function for proper temporal credit.
 2. **Autoregressive neighbor selection** — select neighbors one at a time per agent, conditioning on previous selections. Use a Plackett-Luce distribution over the pointer-net scores. Each selection gets its own reward attribution. Requires custom action distribution + env wrapper.
-3. **Multi-agent RL** — treat each agent as a separate agent in RLlib's multi-agent mode. Per-agent obs, per-agent reward, per-agent policy. The action per agent is a 19-dim binary vector — much smaller than 380. The env already supports `multi_env` mode.
+3. **Temporal reward shaping** — replace the instantaneous control cost with a TEMPORAL metric that directly captures the selectivity benefit. For example: reward = -(control cost at time t) + γ × (reduction in velocity entropy from t-1 to t). This would make selective policies immediately rewarded when they achieve alignment improvement with fewer connections.
 
 **What's been ruled out:**
 - Binary action space: bistable (FC/empty attractors), no stable intermediate (Phases 5-10).
 - Continuous action space alone: eliminates bistability but doesn't solve credit assignment. Policy oscillates, NaN instability, no checkpoint beats FC (Phase 11).
+- Per-agent reward decomposition (centralized policy): distinguishes agents but not edges. Per-step rewards still push toward FC. All variants converge to FC or collapse (Phase 12).
 - Architectural biases (distance, rank, top-K): all reduce to hardcoded heuristics. RL either contributes nothing or degrades (Phase 10).
 - BC + RL fine-tuning: sf=0.15 destroys any initialization in 1-2 iters. Lower sf → no learning (Phase 10).
 - Reward weight tuning (w_ctrl, w_vel, w_pos): doesn't address the credit assignment gap (Phases 7-8, 11).
