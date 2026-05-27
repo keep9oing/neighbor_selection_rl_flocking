@@ -60,6 +60,7 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             self.per_agent_credit = cfg.get("per_agent_credit", False)
             self.pa_credit_alpha = cfg.get("pa_credit_alpha", 1.0)
             self.pa_replace_ppo = cfg.get("pa_replace_ppo", False)
+            self.dist_aux_coef = cfg.get("dist_aux_coef", 0.0)
             self._pretrained_weights_path = cfg.get("pretrained_weights_path", None)
             self.aux_enabled = cfg["aux_enabled"] if "aux_enabled" in cfg else False
             self.aux_loss_coef = cfg["aux_loss_coef"] if "aux_loss_coef" in cfg else 0.1
@@ -255,6 +256,10 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
 
         x = self.attention_scores_to_logits(att)  # (batch_size, num_agents_max * num_agents_max * 2)
         self._cached_logits = x
+        if self.dist_aux_coef > 0:
+            self._cached_att = att  # (B, N, N) raw attention scores
+            local_obs = obs_dict["local_agent_infos"]  # (B, N, N, obs_dim)
+            self._cached_dist_sq = (local_obs[:, :, :, :2] ** 2).sum(dim=-1)  # (B, N, N)
 
         if self.share_layers:
             self.values = h_c_N.squeeze(1)                      # (batch_size, d_embed_context)
@@ -384,6 +389,7 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
         self._last_aux_loss = None
         self._last_aux_loss_critic = None
         self._last_pa_pg_loss = None
+        self._last_dist_aux_loss = None
 
         if self.aux_enabled and hasattr(self, '_aux_target'):
             target = self._aux_target
@@ -400,6 +406,26 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
                     self.aux_branch_critic, self._aux_features_critic, target, pad, nm)
                 total_aux = total_aux + self.aux_loss_coef_critic * aux_critic
                 self._last_aux_loss_critic = aux_critic.detach()
+
+        # --- Distance supervision auxiliary loss ---
+        if self.dist_aux_coef > 0 and hasattr(self, '_cached_att') and hasattr(self, '_aux_padding_mask'):
+            att = self._cached_att  # (B, N, N)
+            dist_sq = self._cached_dist_sq  # (B, N, N)
+            pad = self._aux_padding_mask  # (B, N)
+            edge_mask = pad.unsqueeze(2) * pad.unsqueeze(1)  # (B, N, N)
+            N = att.shape[-1]
+            diag = torch.eye(N, device=att.device).unsqueeze(0)
+            edge_mask = edge_mask * (1.0 - diag)  # exclude diagonal
+
+            # Rank-based target: K nearest get positive score, rest get negative
+            K = 10
+            dist_sq_masked = dist_sq + (1.0 - edge_mask) * 1e9 + diag * 1e9
+            ranks = dist_sq_masked.argsort(dim=-1).argsort(dim=-1).float()
+            target_score = (K - 0.5 - ranks) / K  # +0.95 for rank 0, -0.05 for rank K, ...
+            valid_count = edge_mask.sum().clamp(min=1.0)
+            dist_aux = ((att - target_score) ** 2 * edge_mask).sum() / valid_count
+            total_aux = total_aux + self.dist_aux_coef * dist_aux
+            self._last_dist_aux_loss = dist_aux.detach()
 
         # --- Per-agent credit assignment ---
         pa_loss = torch.tensor(0.0, device=policy_loss[0].device)
@@ -471,6 +497,8 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
                 d["aux_mse_critic"] = float(self._last_aux_loss_critic)
         if hasattr(self, '_last_pa_pg_loss') and self._last_pa_pg_loss is not None:
             d["pa_pg_loss"] = float(self._last_pa_pg_loss)
+        if hasattr(self, '_last_dist_aux_loss') and self._last_dist_aux_loss is not None:
+            d["dist_aux"] = float(self._last_dist_aux_loss)
         return d
 
 

@@ -77,6 +77,7 @@ class EnvConfig(BaseModel):
     acs_train_w_vel: float = 0.2
     acs_train_w_ctrl: float = 0.02
     acs_train_w_conn: float = 0.0
+    acs_train_w_align: float = 0.0
     # ACS neighbor selection option: if True, neighbor selection (action) applies only to heading (alignment) control,
     # while cohesion/separation uses the original (full) neighbor network
     apply_to_heading_only: bool = False
@@ -1292,6 +1293,17 @@ class NeighborSelectionFlockingEnv(gym.Env):
         return spatial_entropy, velocity_entropy
 
     def get_extra_info(self, info, state, rel_state, control_inputs, rewards, done):
+        w_align = self.config.env.acs_train_w_align
+        if w_align > 0 and self.continuous_action and hasattr(self, 'current_action'):
+            action = self.current_action.astype(np.float64)
+            cos_dtheta = np.cos(rel_state["rel_agent_headings"])
+            padding = state["padding_mask"]
+            numerator = (action * cos_dtheta).sum(axis=1)
+            denominator = action.sum(axis=1).clip(min=1.0)
+            per_agent_align = (numerator / denominator).astype(np.float32)
+            per_agent_align[~padding] = 0.0
+            if "per_agent_rewards" in info:
+                info["per_agent_rewards"] = info["per_agent_rewards"] + w_align * per_agent_align
         return info
 
     def compute_custom_reward(self, state, rel_state, control_inputs, rewards, done):
@@ -1333,11 +1345,25 @@ class NeighborSelectionFlockingEnv(gym.Env):
                 else:
                     self._conn_ratio = 0.0
 
+            # Per-agent alignment reward (mean over agents for scalar reward)
+            align_reward = 0.0
+            w_align = self.config.env.acs_train_w_align
+            if w_align > 0 and self.continuous_action and hasattr(self, 'current_action'):
+                action = self.current_action.astype(np.float64)
+                cos_dtheta = np.cos(rel_state["rel_agent_headings"])
+                padding_mask_a = state["padding_mask"]
+                numer = (action * cos_dtheta).sum(axis=1)
+                denom = action.sum(axis=1).clip(min=1.0)
+                pa_align = numer / denom
+                pa_align[~padding_mask_a] = 0.0
+                align_reward = float(pa_align[padding_mask_a].mean()) if padding_mask_a.any() else 0.0
+
             # Get the custom reward
             custom_reward = (self.config.env.acs_train_w_pos * pos_error_reward
                              + self.config.env.acs_train_w_vel * vel_error_reward
                              + self.config.env.acs_train_w_ctrl * control_cost
-                             + w_conn * conn_cost)
+                             + w_conn * conn_cost
+                             + w_align * align_reward)
             return custom_reward
 
         return NotImplemented

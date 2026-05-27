@@ -19,10 +19,16 @@ if __name__ == "__main__":
     default_config_path = "./envs/default_env_config.yaml"
     my_config = load_config(default_config_path)
 
+    w_align = 0.0
+    for a in sys.argv[1:]:
+        if a.startswith("--w_align="):
+            w_align = float(a.split("=")[1])
+
     my_config.env.acs_train_w_ctrl = w_ctrl
     my_config.env.acs_train_w_pos  = 1.0
     my_config.env.acs_train_w_vel  = 0.2
     my_config.env.acs_train_w_conn = 0.0
+    my_config.env.acs_train_w_align = w_align
     my_config.env.action_type = "binary_vector"
     my_config.env.agent_name_prefix = "agent_"
     my_config.env.alignment_goal = 0.97
@@ -69,6 +75,14 @@ if __name__ == "__main__":
     env_name = "neighbor_selection_flocking_env"
     register_env(env_name, lambda cfg: NeighborSelectionFlockingEnv(cfg))
 
+    alpha = 1.0
+    for a in sys.argv[2:]:
+        try:
+            if not a.startswith("--"):
+                alpha = float(a)
+        except ValueError:
+            pass
+
     custom_model_config = {
         "d_embed_context": 128,
         "d_embed_input": 128,
@@ -93,8 +107,8 @@ if __name__ == "__main__":
         "aux_target_dim": 4,
         "aux_loss_coef_critic": 0.05,
         "continuous_action": True,
-        "per_agent_credit": True,
-        "pa_credit_alpha": float(sys.argv[2]) if len(sys.argv) > 2 else 1.0,
+        "per_agent_credit": "--no_pa" not in sys.argv,
+        "pa_credit_alpha": alpha,
         "pa_replace_ppo": "--replace" in sys.argv,
     }
 
@@ -102,9 +116,9 @@ if __name__ == "__main__":
     ModelCatalog.register_custom_model(model_name, NeighborSelectionPPORLlib)
     ModelCatalog.register_custom_action_dist("beta_dist", TorchContinuousWeightDist)
 
-    alpha = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
     mode = "replace" if "--replace" in sys.argv else "additive"
-    run_name = f"peragent_v3_{mode}_a{alpha:.1f}_wctrl{w_ctrl:.2f}_260527"
+    pa_on = "pa" if "--no_pa" not in sys.argv else "nopa"
+    run_name = f"align{w_align:.1f}_wctrl{w_ctrl:.2f}_{pa_on}_260527"
 
     tune.run(
         GradLoggingPPO,
