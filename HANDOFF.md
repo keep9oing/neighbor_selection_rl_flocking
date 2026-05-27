@@ -370,5 +370,19 @@ The top-K constraint successfully eliminates the FC/empty bistability, but the m
 
 **Session conclusion:** Continuous attention weights eliminate binary bistability and enable smooth gradient-based exploration of the weight space. However, the per-edge credit assignment problem remains the fundamental bottleneck. With 400 continuous decisions and one scalar reward, the policy cannot reliably determine which specific neighbors to up/downweight. It oscillates between global weight adjustments (all up or all down) without per-edge discrimination.
 
+**V9 (w_ctrl=0.2, sf=0.10, grad_clip=1.0) checkpoint 10 formal eval** (100 episodes):
+- RL: reward=-287.4±109.0, vel_ent=0.321±1.533, **edges/agent=9.99** (53% of FC)
+- FC: reward=-266.2±100.6, vel_ent=0.069±0.194, edges=19.0
+- RL **-8.0% reward (WORSE)**. Uses half the edges but gets worse alignment AND higher control cost.
+- **Reward mismatch**: training w_ctrl=0.2 penalizes connectivity, but eval uses pure control cost (no w_ctrl). The policy optimized for selectivity under a training reward that doesn't match the eval metric.
+
 ### Running experiments
-V7 (GPU 1, w_ctrl=0.1) and V8 (GPU 3, w_ctrl=0.2) running to 100 iterations. Checkpoints at every 10 iters. Evaluate best checkpoints from each in next session.
+V9 (GPU 3, w_ctrl=0.2, grad_clip=1.0) running to 100 iterations.
+
+### Conclusion on continuous attention weights
+Continuous weights solve bistability but NOT credit assignment. All evaluated checkpoints are worse than or equal to FC-ACS:
+- V2 ckpt 10 (w_ctrl=0.02): -3.4% vs FC
+- V3 ckpt 10 (w_ctrl=0.02): +0.7% vs FC (noise)  
+- V9 ckpt 10 (w_ctrl=0.2): -8.0% vs FC
+
+The next approach should be **per-agent reward decomposition** — the only approach that addresses the fundamental credit assignment bottleneck (400 decisions, 1 scalar reward).
