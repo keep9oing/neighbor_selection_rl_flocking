@@ -321,10 +321,11 @@ The top-K constraint successfully eliminates the FC/empty bistability, but the m
 ## Current State (2026-05-27)
 
 ### Running experiments
-`distaux_v2_rank10_260527` — distance aux with rank-based K=10 target, w_ctrl=0.1, sf=0.10. Training on GPU 1. At iter 3, conn=0.487, vel_ent=0.31.
+None active. `distaux_v2_rank10_260527` completed 100 iterations. Checkpoints at 60, 70, 80, 90, 100.
+A 400-episode evaluation of checkpoint 100 with Welch's t-test is IN PROGRESS (started 2026-05-28 ~08:00, expect ~08:35 completion). Script: `eval_stat.py`. Check output for results.
 
-### FC-ACS HAS BEEN BEATEN BY RL (Phase 13, dist_aux v2)
-**dist_aux v2 ckpt 10** (100 episodes, deterministic): RL reward=-263.3±73.9, FC reward=-271.8±104.4. **+3.1% improvement, 9.78 edges/agent.** vel_ent=0.141 (35% better than FC's 0.219). The distance-supervised auxiliary loss on attention scores produces a KNN-like policy with ~10 edges. The RL contribution is the combined PPO+aux training that learns when and how to select neighbors based on the full observation.
+### FC-ACS preliminary beat (Phase 13, dist_aux v2) — PENDING 400-EP CONFIRMATION
+**dist_aux v2 ckpt 10** (100 episodes, deterministic): RL reward=-263.3±73.9, FC reward=-271.8±104.4. **+3.1%, 9.78 edges/agent.** But 100 episodes is insufficient for statistical significance — Welch's t-test needed. Training completed 100 iters; ckpt 100 training conn=0.505, edges~9.8. **400-episode eval of ckpt 100 is running — check eval_stat.py output for definitive result.**
 
 ### Git state
 Branch `exp/autonomous-research`. Latest commit: `231f6a9`.
