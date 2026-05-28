@@ -310,22 +310,22 @@ The top-K constraint successfully eliminates the FC/empty bistability, but the m
 **V2 (target = rank-centered K=10, dist_aux_coef=1.0, w_ctrl=0.1):**
 - Target: `(K - 0.5 - rank) / K` where K=10. Positive for 10 nearest, negative for rest.
 - Training (10 iters): conn stable at 0.487-0.492 (~9.3-9.4 edges), vel_ent=0.28-0.49, entropy stable 159-167.
-- **Formal eval (100 episodes, deterministic, ckpt 10):**
-  - RL: reward=-263.3±73.9, vel_ent=0.141±0.129, edges=**9.78±0.01**
-  - FC: reward=-271.8±104.4, vel_ent=0.219±1.409, edges=19.0
-  - **RL beats FC by +3.1%, with 35% better alignment and ~50% fewer edges.**
-- First RL policy to genuinely beat FC-ACS across all 13 phases of research.
+- **Formal eval (100 episodes, ckpt 10):** RL reward=-263.3±73.9, FC=-271.8±104.4, +3.1%. edges=9.78. Appeared promising.
+- **Formal eval (400 episodes, ckpt 100, Welch's t-test):** RL reward=-266.2±76.1, FC=-266.6±96.7. **+0.2%, t=0.07, p=0.95 — NOT significant.** edges=9.69. vel_ent=0.37 (worse than FC's 0.15). The policy achieves equivalent reward through a different trade-off: fewer edges → lower control cost, but worse alignment.
+- **The distance aux produces genuine selectivity (~10 edges) for the first time, but the RL+aux policy does not exceed FC performance.** The soft sigmoid selection may not match KNN's hard top-K effectiveness.
 
 **Key finding:** Distance-supervised attention provides the per-edge credit signal that reward-based methods lack. The auxiliary loss directly teaches the model which edges to select (nearby) and reject (far), bypassing the scalar-advantage bottleneck entirely. The PPO loss then fine-tunes overall policy quality.
 
 ## Current State (2026-05-27)
 
 ### Running experiments
-None active. `distaux_v2_rank10_260527` completed 100 iterations. Checkpoints at 60, 70, 80, 90, 100.
-A 400-episode evaluation of checkpoint 100 with Welch's t-test is IN PROGRESS (started 2026-05-28 ~08:00, expect ~08:35 completion). Script: `eval_stat.py`. Check output for results.
+None. `distaux_v2_rank10_260527` completed 100 iterations. Checkpoints at 60, 70, 80, 90, 100. Ckpt 100 evaluated (400 ep): NOT significant vs FC.
 
-### FC-ACS preliminary beat (Phase 13, dist_aux v2) — PENDING 400-EP CONFIRMATION
-**dist_aux v2 ckpt 10** (100 episodes, deterministic): RL reward=-263.3±73.9, FC reward=-271.8±104.4. **+3.1%, 9.78 edges/agent.** But 100 episodes is insufficient for statistical significance — Welch's t-test needed. Training completed 100 iters; ckpt 100 training conn=0.505, edges~9.8. **400-episode eval of ckpt 100 is running — check eval_stat.py output for definitive result.**
+### FC-ACS has NOT been beaten by RL
+**dist_aux v2** achieves genuine selectivity (~10 edges/agent) but does NOT beat FC in 400-episode evaluation.
+- **ckpt 10 (100 ep):** RL reward=-263.3±73.9, FC=-271.8±104.4, +3.1% — appeared promising but was NOISE.
+- **ckpt 100 (400 ep, Welch's t-test):** RL reward=-266.2±76.1, FC=-266.6±96.7, **+0.2%, t=0.07, p=0.95 — NOT significant.** Edges=9.69 (genuine selectivity), but vel_ent=0.37 (worse than FC's 0.15). The policy trades alignment quality for lower control cost, netting equivalent reward.
+- **K=10 nearest heuristic still beats FC** (paired t=4.94, reward -225 vs -272, 17% better). The RL policy's distance-based selection matches FC but doesn't reach KNN performance.
 
 ### Git state
 Branch `exp/autonomous-research`. Latest commit: `231f6a9`.
