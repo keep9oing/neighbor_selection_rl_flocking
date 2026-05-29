@@ -6,7 +6,7 @@ Train an ego-centric RL policy that, given each agent's local observation, selec
 
 **Success metric:** The ego-centric policy must **clearly outperform the fully-connected ACS baseline** — faster convergence to flocking and/or better eval reward. The centralized-obs model already achieved this under a **relaxed convergence condition (vel_ent < 1.0 instead of the default 0.1)**: it converges faster and achieves better eval reward than FC-ACS. The ego-centric model should target the same. Under FC, ego-centric and centralized observations are mathematically interconvertible, so a parameter-sharing ego-centric policy can in principle replicate the centralized policy's decisions.
 
-**Current status: FC-ACS has NOT been beaten by RL.** K=10 nearest heuristic beats FC by 17% (t=4.94), confirming selective IS better. But no RL-trained ego-centric policy has matched KNN performance. Binary action space has bistability; continuous action space (Phase 11) eliminates bistability but per-edge credit assignment remains unsolved.
+**Current status (2026-05-29): FC-ACS BEATEN at 400 episodes (p<0.05).** Phase 14 — **hard top-K=10 binary selection + distance-supervised attention** — beats FC at 400 episodes: **trained-as-evaluated checkpoint +15.6% (t=7.26, p<1e-6)**; and eval-time hard top-K applied to the Phase-13 checkpoint +10.6% (t=4.63, p=4.5e-06). This is the first formally-evaluated learned checkpoint to beat FC. HONEST FRAMING: the win **reproduces the KNN heuristic** (94.5% selection overlap with true-distance KNN). Hard binary selection of ~10 distance-ranked neighbors cuts control cost vs FC's 19 edges (alignment is actually *worse* — vel_ent 0.92 vs 0.20 — but the control-cost saving dominates the reward). It does **NOT exceed the KNN heuristic itself** (true-KNN ≈ +16.6% here / +17% historically, t≈5). dist_aux is supervised (target=distance rank) and hard top-K is non-differentiable, so PPO contributes little beyond the distance signal — closer to "learned KNN" than RL-discovered selection. Prior context: soft-selection RL (Phases 5-13) only matched FC; the blocker was the *soft* action space diluting the cost saving, not the attention.
 
 **Evaluation metrics** (logged by callbacks):
 - **Episode reward** — primary metric. Sum of per-agent ACS rewards (`env._compute_rewards()`): negative heading-rate control cost + cruise cost. Must clearly exceed FC-ACS baseline.
@@ -316,21 +316,59 @@ The top-K constraint successfully eliminates the FC/empty bistability, but the m
 
 **Key finding:** Distance-supervised attention provides the per-edge credit signal that reward-based methods lack. The auxiliary loss directly teaches the model which edges to select (nearby) and reject (far), bypassing the scalar-advantage bottleneck entirely. The PPO loss then fine-tunes overall policy quality.
 
-## Current State (2026-05-27)
+### Phase 14: Hard top-K binary selection + dist_aux — **FC-ACS BEATEN (p<0.05, 400 ep)** (2026-05-29)
+
+**Insight:** Phase 13's dist_aux gave genuine selectivity (~10 edges) but only *matched* FC because its **soft** selection (continuous weights with a 0.2 floor, or sigmoid logits near 0) kept nonzero weight on the 9 "rejected" neighbors, diluting the cost saving. The KNN heuristic beats FC by 17% via **hard** top-K binary selection. Fix: force exactly K=10 hard binary edges (top-K by attention), letting dist_aux-supervised attention decide WHICH 10.
+
+**Implementation:**
+- `models/ppo.py` — gated `hard_top_k` flag (default False → existing checkpoints byte-identical). Binary-only hard path in `attention_scores_to_logits()`: per row, take top-K(=10) off-diagonal by attention score; selected (∪ diagonal) get logit score `att+BIG`, non-selected `att−BIG` (BIG=20) → argmax always selects exactly the top-K + self. Gradient path to att preserved, but the *selection set* comes from attention rank (supervised by dist_aux), and the action is deterministic (entropy≈0).
+- `train_hardtopk.py` — binary (continuous_action=False), top_k=10, hard_top_k=True, dist_aux_coef=1.0, scale_factor=0.1, w_ctrl=0.1, aux_enabled (0.3/0.05), grad_clip=1.0, lr 5e-4, batch 16000, 10 sgd iters, clip 0.15, entropy 0, 4 workers, num_gpus=0.5. No beta_dist (binary uses default action dist).
+- `eval_hardtopk.py` — probe: applies hard top-K=10 to a checkpoint's attention (`model.actor()` → att → top-10 binary), runs binary env, Welch t-test vs FC + a true-distance KNN reference. (Note: the original sanity gate range −280..−260 was too narrow; FC legitimately varies to −282. Widened to −300..−255.)
+- Result: exactly 11 edges/agent (10 + self) confirmed.
+
+**Track A — eval-time hard top-K applied to the EXISTING dist_aux v2 ckpt 100 (continuous-trained), env in binary mode, 400 ep, deterministic, Welch's t-test:**
+
+| Policy | reward | vel_ent(final) | edges/agent | t vs FC | p |
+|--------|--------|----------------|-------------|---------|---|
+| **HardTopK (learned att)** | **−248.96 ± 68.44** | 0.92 | 10.0 | **4.625** | **4.5e-06** |
+| FC (PureACS, binary) | −278.62 ± 108.27 | 0.20 | 19.0 | — | — |
+| KNN-True (ref, hard top-10 by actual distance) | −231.07 ± 42.61 (Stage-1 150ep) | 0.34 | 10.0 | 5.03 | 1.1e-06 |
+
+- **HardTopK SIGNIFICANTLY BEATS FC: +29.66 reward (+10.6%), t=4.625, p=4.5e-06.** ✅ Goal criterion met.
+- Learned attention matches true-distance KNN at **94.5% selection overlap** — the dist_aux attention is essentially a distance estimator.
+
+**What actually won (honest):**
+1. HARD BINARY selection of ~distance-ranked neighbors = reproduces KNN. NOT better than KNN (HardTopK +10.6% < true-KNN +16.6%).
+2. Mechanism: 10 edges → −10.6% total control cost vs FC's 19 edges. Alignment is *worse* (vel_ent 0.92 vs FC 0.20), but the control-cost saving dominates the ACS reward. Same trade-off KNN makes.
+3. Phase 13 soft dist_aux only matched FC because rejected neighbors kept ≥floor weight; hard binary fully drops them — this is the whole difference.
+4. **Caveat on "RL":** dist_aux is supervised and hard top-K is non-differentiable, so PPO adds little beyond the distance signal. This is "learned KNN," not RL discovering a better-than-distance selector. It satisfies the goal (formally-evaluated learned checkpoint beats FC, p<0.05, 400 ep) but does not show RL exceeding the heuristic.
+
+**Track B — clean trained-as-evaluated (`hardtopk10_distaux_260529`): CONFIRMED.** `train_hardtopk.py` trains WITH hard top-K in the loop (binary, top_k=10, hard_top_k=True, dist_aux_coef=1.0), so the policy is evaluated identically to how it's trained — `eval_stat.py` auto-reads `hard_top_k` from params.json → binary argmax = exactly top-10. No train/eval mismatch.
+- **Checkpoint 10 (400 ep, `eval_stat.py` Welch's t-test): RL=−231.58 ± 48.82, FC=−274.45 ± 107.37, +42.88 (+15.6%), t=7.26, p<1e-6 → SIGNIFICANT.** edges=10.0, vel_ent(final)=0.54.
+- **Better than Track A** (+15.6% vs +10.6%) with better alignment (vel_ent 0.54 vs 0.92) — training shaped attention specifically for hard selection. At −231.58 it **matches the true-distance KNN reference** (−231.07): it reaches the KNN ceiling by iter 10.
+- This is the gold-standard result: a trained learned checkpoint, evaluated exactly as trained, beats FC at 400 ep (p<1e-6). Training was stopped at iter 17 (ckpt 10 is the winner; no gain expected past KNN-level — the architecture can't beat "10 nearest").
+- NOTE: RLlib 2.1.0 drops `dist_aux`/`aux_mse` from result.json logging on the multi-GPU learner path (same limitation that motivated `grad_logging_ppo.py`); the loss IS computed/applied — verified directly (`_last_dist_aux_loss`≈0.31). Monitor via `final_conn_ratio_mean` + reward instead.
+
+## Current State (2026-05-29)
 
 ### Running experiments
-None. `distaux_v2_rank10_260527` completed 100 iterations. Checkpoints at 60, 70, 80, 90, 100. Ckpt 100 evaluated (400 ep): NOT significant vs FC.
+None (all stopped, GPUs free). Track B `hardtopk10_distaux_260529` was stopped at iter 17 — **ckpt 10 is the evaluated winner** (beats FC +15.6%, p<1e-6, 400 ep). Only `checkpoint_000010` was saved. Prior: `distaux_v2_rank10_260527` completed 100 iters (ckpt 100: NOT significant vs FC).
 
-### FC-ACS has NOT been beaten by RL
-**dist_aux v2** achieves genuine selectivity (~10 edges/agent) but does NOT beat FC in 400-episode evaluation.
-- **ckpt 10 (100 ep):** RL reward=-263.3±73.9, FC=-271.8±104.4, +3.1% — appeared promising but was NOISE.
-- **ckpt 100 (400 ep, Welch's t-test):** RL reward=-266.2±76.1, FC=-266.6±96.7, **+0.2%, t=0.07, p=0.95 — NOT significant.** Edges=9.69 (genuine selectivity), but vel_ent=0.37 (worse than FC's 0.15). The policy trades alignment quality for lower control cost, netting equivalent reward.
-- **K=10 nearest heuristic still beats FC** (paired t=4.94, reward -225 vs -272, 17% better). The RL policy's distance-based selection matches FC but doesn't reach KNN performance.
+### FC-ACS BEATEN (2026-05-29) — see Phase 14
+**Hard top-K=10 binary selection + dist_aux** beats FC at 400 ep: trained-as-evaluated ckpt **+15.6% (t=7.26, p<1e-6)**; eval-time hard top-K on the Phase-13 ckpt +10.6% (t=4.63, p=4.5e-06). The win **reproduces KNN** (94.5% selection overlap; matches true-KNN reward −231.6 vs −231.1) — it beats FC but does NOT exceed the KNN heuristic. The earlier blocker (Phases 5-13) was the *soft* action space diluting the control-cost saving, NOT the attention: dist_aux already supplied a good distance ranking; hard binary selection converts it into a KNN-equivalent topology that fully drops the 9 far neighbors.
+
+**Prior (now superseded) — why soft dist_aux v2 only matched FC:** dist_aux v2 (continuous, ckpt 100, 400 ep): RL=−266.2, FC=−266.6, +0.2%, t=0.07, p=0.95 — NOT significant. Edges=9.69 but vel_ent=0.37; soft weights kept ≥floor weight on "rejected" neighbors, so the control-cost saving was diluted to zero net gain. **K=10 nearest heuristic beats FC** (t≈5, −225 vs −272, ~17%) — the selectivity target the learned policy now reaches.
 
 ### Git state
-Branch `exp/autonomous-research`. Latest commit: `231f6a9`.
-New files this session: `train_peragent.py`.
-Modified this session: `envs/env.py` (per_agent_rewards, alignment reward, w_align), `models/ppo.py` (per-agent credit + dist_aux), `callbacks.py` (on_postprocess_trajectory).
+Branch `exp/autonomous-research`. Committed locally this session (2026-05-29).
+New files (2026-05-29): `train_hardtopk.py` (binary hard-top-K + dist_aux training), `eval_hardtopk.py` (hard-top-K probe: applies hard top-K to a checkpoint's attention, binary env, Welch t-test vs FC + true-KNN reference).
+Modified (2026-05-29): `models/ppo.py` — gated `hard_top_k` flag + hard top-K binary path in `attention_scores_to_logits()` (default behavior byte-identical, existing checkpoints unaffected).
+
+### What was done in 2026-05-29 session (Phase 14 — FC-ACS BEATEN)
+- **Diagnosis acted on:** Phase 13's soft dist_aux matched FC because soft weights diluted the control-cost saving. KNN beats FC via *hard* selection. → forced exactly K=10 hard binary edges, attention (dist_aux-supervised) picks which 10.
+- **Track A (fast probe):** applied hard top-K=10 at eval to the existing dist_aux v2 ckpt 100. 400 ep: **+10.6%, t=4.63, p=4.5e-06.** Learned attention overlaps true-KNN selection 94.5%.
+- **Track B (clean, trained-as-evaluated):** trained `train_hardtopk.py` (hard top-K in the loop) on GPU 3. **ckpt 10, 400 ep via eval_stat.py: +15.6%, t=7.26, p<1e-6** — matches the true-KNN ceiling. Stopped at iter 17 (no gain past KNN-level).
+- **Result:** Goal met — first formally-evaluated learned checkpoint to beat FC at 400 ep (p<0.05). HONEST: it reproduces/matches KNN, does not exceed it; PPO adds little beyond the supervised dist_aux signal ("learned KNN").
 
 ### Experiment results on disk
 All under `/workspace/test_results/`. Key ones from prior sessions:
@@ -377,7 +415,9 @@ Key ones from Phase 11 (continuous actions):
 
 ## Recommended next approaches (prioritized)
 
-**The blocker has two dimensions: (1) edge-level credit assignment and (2) temporal credit.** Per-step rewards favor FC at every timestep — the selectivity benefit only appears over 1000+ cumulative steps. Per-agent decomposition (Phase 12) solves neither: it distinguishes agents but not edges, and operates per-step so can't capture the temporal selectivity benefit.
+**UPDATE (2026-05-29): the original goal (beat FC-ACS, p<0.05, 400 ep) is MET** — Phase 14 (hard top-K=10 + dist_aux), trained-as-evaluated ckpt +15.6%, t=7.26, p<1e-6. The **new frontier is whether a learned policy can EXCEED the KNN heuristic** (the current best reproduces/matches KNN but does not beat it; PPO adds little beyond the supervised dist_aux distance signal). To get genuine RL value-add beyond distance: (a) make hard top-K *differentiable* (straight-through / Gumbel-top-K) so PPO can push the selection OFF the pure distance ranking toward reward-better neighbors; (b) learn K per-agent/per-step rather than fixing K=10; (c) target a selection criterion distance can't capture (e.g., future-alignment-predictive neighbors). The credit-assignment notes below remain the obstacle for (a)–(c).
+
+(Historical — the blocker that made FC unbeaten through Phase 13:) **two dimensions: (1) edge-level credit assignment and (2) temporal credit.** Per-step rewards favor FC at every timestep — the selectivity benefit only appears over 1000+ cumulative steps. Per-agent decomposition (Phase 12) solves neither: it distinguishes agents but not edges, and operates per-step so can't capture the temporal selectivity benefit. (Phase 14 sidestepped this entirely: dist_aux supervises edge selection directly, and hard binary top-K realizes the KNN topology whose temporal benefit is already known.)
 
 1. **Multi-agent RL** (highest priority) — treat each agent as a separate agent in RLlib's multi-agent mode. Per-agent obs, per-agent reward, per-agent policy. The action per agent is a 19-dim binary/continuous vector — much smaller than 380. The env already supports `multi_env` mode. Each agent's smaller action space makes credit assignment tractable. Combined with per-agent rewards (already implemented in Phase 12), this gives each agent its own value function for proper temporal credit.
 2. **Autoregressive neighbor selection** — select neighbors one at a time per agent, conditioning on previous selections. Use a Plackett-Luce distribution over the pointer-net scores. Each selection gets its own reward attribution. Requires custom action distribution + env wrapper.

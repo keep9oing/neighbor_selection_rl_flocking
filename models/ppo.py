@@ -55,6 +55,7 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             #     "context"                  — use agent i's pooled context vector h_c_N[i] to predict
             #                                  i's own flock-center-frame state.
             self.top_k = cfg["top_k"] if "top_k" in cfg else None
+            self.hard_top_k = cfg.get("hard_top_k", False)
             self.distance_bias_scale = cfg["distance_bias_scale"] if "distance_bias_scale" in cfg else 0.0
             self.continuous_action = cfg.get("continuous_action", False)
             self.per_agent_credit = cfg.get("per_agent_credit", False)
@@ -301,6 +302,25 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
 
         if self.distance_bias_scale > 0 and hasattr(self, '_distance_bias'):
             attention_scores = attention_scores + self._distance_bias
+
+        if self.hard_top_k and self.top_k is not None and not self.continuous_action:
+            # HARD top-K binary selection. Each agent i selects EXACTLY top_k of its
+            # highest-attention neighbors (off-diagonal) as edge=1, plus the self-loop.
+            # A large constant BIG dominates the argmax so the binary decision is fixed by
+            # the top-K mask, while the raw attention_scores term keeps a gradient path
+            # to attention (and thus to dist_aux's ranking objective): d(+s)/d(att)=1.
+            BIG = 20.0
+            diag_mask = torch.eye(num_agents_max, device=attention_scores.device).bool()
+            off_diag = attention_scores.masked_fill(diag_mask.unsqueeze(0), float('-inf'))
+            k = min(self.top_k, num_agents_max - 1)
+            _, topk_idx = off_diag.topk(k, dim=-1)
+            topk_mask = torch.zeros_like(attention_scores, dtype=torch.bool)
+            topk_mask.scatter_(2, topk_idx, True)
+            topk_mask = topk_mask | diag_mask.unsqueeze(0)  # diagonal always selected
+            # Selected: s = att + BIG (edge wins argmax); non-selected: s = att - BIG (no-edge wins)
+            s = torch.where(topk_mask, attention_scores + BIG, attention_scores - BIG)
+            z_concatenated = torch.cat((-s.unsqueeze(-1), s.unsqueeze(-1)), dim=-1)
+            return z_concatenated.reshape(batch_size, num_agents_max * num_agents_max * 2)
 
         if self.top_k is not None and self.top_k < num_agents_max - 1:
             diag_mask = torch.eye(num_agents_max, device=attention_scores.device).bool()
