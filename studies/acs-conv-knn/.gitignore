@@ -1,0 +1,9 @@
+# Heavy / regenerable artifacts — never commit (user constraint)
+data/
+figs/
+logs/
+__pycache__/
+*.npz
+*.parquet
+*.png
+*.log
