@@ -1,4 +1,5 @@
 import os
+from collections import deque
 from copy import deepcopy
 import warnings
 import gym  # gym 0.23.1
@@ -82,6 +83,23 @@ class EnvConfig(BaseModel):
     # while cohesion/separation uses the original (full) neighbor network
     apply_to_heading_only: bool = False
     continuous_action: bool = False
+    # --- C2 convergence-criterion support (study acs-c2-train) ---
+    # All fields default to legacy behavior. C2 termination: episode ends early
+    # ONLY on success (phi>c2_phi_goal held c2_align_window steps AND all active
+    # agents in a single r0-proximity component held c2_window steps AND relative
+    # peak-to-peak of sigma_p over c2_window < c2_eps); failures run to
+    # max_time_steps. Active only when use_fixed_episode_length is False.
+    termination_mode: str = "legacy"      # "legacy" | "c2"
+    c2_phi_goal: float = 0.98
+    c2_align_window: int = 50
+    c2_window: int = 300                  # cohesion hold AND stationarity window
+    c2_eps: float = 0.05                  # relative p2p band on sigma_p
+    reward_mode: str = "legacy"           # "legacy" | "c2_shaping"
+    c2_w_pos: float = 4.0                 # cohesion shaping weight
+    c2_w_vel: float = 0.2                 # alignment shaping weight
+    c2_w_ctrl: float = 0.1                # control-cost weight
+    c2_success_bonus: float = 10.0        # one-time reward at C2 fire
+    expose_global_stats: bool = False     # adds obs key "global_stats" (4,)
 
 
 class Config(BaseModel):
@@ -240,6 +258,12 @@ class NeighborSelectionFlockingEnv(gym.Env):
                     shape=(self.num_agents_max, 4),
                     dtype=np.float64,
                 )
+            if self.config.env.expose_global_stats:
+                # Swarm-level summary [phi, f_largest, n_comp/N, sigma_p/(L/2)]
+                # for phase awareness (merge vs hold). See study acs-c2-train.
+                obs_space_dict["global_stats"] = Box(
+                    low=-np.inf, high=np.inf, shape=(4,), dtype=np.float64,
+                )
             self.observation_space = Dict(obs_space_dict)
         elif self.config.env.env_mode == "multi_env":
             self.observation_space = Dict({
@@ -324,6 +348,18 @@ class NeighborSelectionFlockingEnv(gym.Env):
             warnings.warn("Centralized observation with periodic boundary is not fully tested; "
                           "consider using ego_centric observation for periodic boundary environments.")
 
+        # C2 support validation (study acs-c2-train)
+        assert self.config.env.termination_mode in ("legacy", "c2"), \
+            f"termination_mode must be 'legacy' or 'c2', got '{self.config.env.termination_mode}'"
+        assert self.config.env.reward_mode in ("legacy", "c2_shaping"), \
+            f"reward_mode must be 'legacy' or 'c2_shaping', got '{self.config.env.reward_mode}'"
+        if (self.config.env.termination_mode == "c2" or self.config.env.reward_mode == "c2_shaping"
+                or self.config.env.expose_global_stats):
+            assert self.config.env.task_type == "acs", \
+                "C2 termination/shaping/global-stats support only task_type='acs'"
+            assert not self.config.env.periodic_boundary, \
+                "C2 termination/shaping/global-stats do not support periodic_boundary"
+
         # Auxiliary target validation
         if self.config.env.expose_aux_target:
             # _get_centralized_obs writes a 4-dim row into a (num_agents_max, obs_dim) array,
@@ -400,6 +436,12 @@ class NeighborSelectionFlockingEnv(gym.Env):
         # Get relative state
         self.rel_state = self.get_relative_state(state=self.state)
 
+        # C2 support: re-init buffers for the custom initial state (the dummy
+        # reset() above already observed ITS initial state; discard that).
+        self._c2_reset()
+        if self._c2_stats_needed():
+            self._c2_observe_state(self.state, self.rel_state)
+
         # Get obs
         obs = self.get_obs(state=self.state, rel_state=self.rel_state, control_inputs=np.zeros(num_agents_max))
 
@@ -436,6 +478,12 @@ class NeighborSelectionFlockingEnv(gym.Env):
 
         # Get relative state
         self.rel_state = self.get_relative_state(state=self.state)
+
+        # C2 support: reset buffers and observe the initial state (index 0 of
+        # the offline judge's series) before building the first obs.
+        self._c2_reset()
+        if self._c2_stats_needed():
+            self._c2_observe_state(self.state, self.rel_state)
 
         # Get obs
         obs = self.get_obs(state=self.state, rel_state=self.rel_state, control_inputs=np.zeros(self.num_agents_max))
@@ -480,6 +528,9 @@ class NeighborSelectionFlockingEnv(gym.Env):
         # # s` = T(s, a)
         next_state, control_inputs, comm_loss_agents = self.env_transition(state, rel_state, joint_action)
         next_rel_state = self.get_relative_state(state=next_state)
+        # C2 support: observe the post-step state (stats shared by obs/termination/reward)
+        if self._c2_stats_needed():
+            self._c2_observe_state(next_state, next_rel_state)
         # # r = R(s, a, s`)
         rewards = self._compute_rewards(
             state=state, action=joint_action, next_state=next_state, control_inputs=control_inputs)
@@ -1081,6 +1132,16 @@ class NeighborSelectionFlockingEnv(gym.Env):
                 obs["global_agent_infos"] = self._get_centralized_obs(
                     state, active_agents_indices, padding_mask
                 )
+            if self.config.env.expose_global_stats:
+                # Swarm summary of the state being observed; computed by
+                # _c2_observe_state just before every get_obs call.
+                st = self._swarm_stats
+                assert st is not None, "expose_global_stats: swarm stats not computed for this state"
+                l2 = self.config.control.initial_position_bound / 2.0
+                obs["global_stats"] = np.array(
+                    [st["phi"], st["f_largest"], st["n_comp"] / st["n_active"], st["sigma_p"] / l2],
+                    dtype=np.float64,
+                )
             return obs
         else:
             raise ValueError(f"self.env_mode: 'single_env' / 'multi_env'; not {self.config.env.env_mode}; in get_obs()")
@@ -1239,8 +1300,13 @@ class NeighborSelectionFlockingEnv(gym.Env):
             self.spatial_entropy_hist[self.time_step] = spatial_entropy
             self.velocity_entropy_hist[self.time_step] = velocity_entropy
 
-            # Check if the spatial and velocity entropies are within the goals
-            if (spatial_entropy < self.config.env.entropy_p_goal) and (velocity_entropy < self.config.env.entropy_v_goal):
+            # C2 termination (study acs-c2-train): success-only early stop.
+            # The fire decision was computed in _c2_observe_state this step.
+            if self._c2_termination_active():
+                if self._c2_fired_now:
+                    done = True
+            # Check if the spatial and velocity entropies are within the goals (legacy criterion)
+            elif (spatial_entropy < self.config.env.entropy_p_goal) and (velocity_entropy < self.config.env.entropy_v_goal):
                 if not self.config.env.use_fixed_episode_length:
                     # Check if the entropies are stable over the last N steps (entropy rate checks)
                     effective_win_len = self.config.env.entropy_rate_window_length - 1
@@ -1292,7 +1358,108 @@ class NeighborSelectionFlockingEnv(gym.Env):
 
         return spatial_entropy, velocity_entropy
 
+    # --- C2 convergence-criterion support (study acs-c2-train) -----------------
+    # Swarm-level stats (phi, r0-proximity components, sigma_p) shared by the
+    # C2 termination state machine, the c2_shaping reward, and the optional
+    # "global_stats" obs key. Buffer semantics replicate the offline judge
+    # (pandas rolling(W) over a series whose index 0 is the INITIAL state), so
+    # reset() appends the initial state and each step() appends the post-step
+    # state; env fire step then equals the offline t_fire exactly.
+
+    def _c2_stats_needed(self):
+        e = self.config.env
+        return (e.task_type == "acs") and (
+            e.expose_global_stats
+            or e.reward_mode == "c2_shaping"
+            or (e.termination_mode == "c2" and not e.use_fixed_episode_length))
+
+    def _c2_termination_active(self):
+        e = self.config.env
+        return e.termination_mode == "c2" and not e.use_fixed_episode_length
+
+    def _c2_reset(self):
+        e = self.config.env
+        self._c2_phis = deque(maxlen=e.c2_align_window)
+        self._c2_singles = deque(maxlen=e.c2_window)
+        self._c2_sps = deque(maxlen=e.c2_window)
+        self._c2_fired_now = False
+        self._swarm_stats = None
+
+    @staticmethod
+    def _connected_component_labels(adj):
+        """Component label per node of an undirected boolean graph (small n)."""
+        n = adj.shape[0]
+        sym = adj | adj.T
+        labels = np.full(n, -1, dtype=np.int64)
+        cur = 0
+        for i in range(n):
+            if labels[i] >= 0:
+                continue
+            stack = [i]
+            labels[i] = cur
+            while stack:
+                u = stack.pop()
+                for v in np.nonzero(sym[u])[0]:
+                    if labels[v] < 0:
+                        labels[v] = cur
+                        stack.append(v)
+            cur += 1
+        return labels
+
+    def _compute_swarm_stats(self, state, rel_state):
+        """phi, r0-proximity component stats, sigma_p over ACTIVE agents."""
+        pm = state["padding_mask"]
+        n = int(pm.sum())
+        vel = state["agent_states"][pm, 2:4].astype(np.float64)
+        spd = np.linalg.norm(vel, axis=1)
+        unit = vel / np.maximum(spd, 1e-12)[:, None]
+        phi = float(np.linalg.norm(unit.mean(axis=0)))
+        act = np.nonzero(pm)[0]
+        d = rel_state["rel_agent_dists"][np.ix_(act, act)]
+        adj = d < self.config.control.r0  # strict <, matching the offline judge
+        labels = self._connected_component_labels(adj)
+        n_comp = int(labels.max()) + 1
+        f_largest = float(np.bincount(labels).max()) / n
+        pos = state["agent_states"][pm, :2].astype(np.float64)
+        sigma_p = float(np.sqrt(pos.var(axis=0).sum()))
+        return {"phi": phi, "n_comp": n_comp, "f_largest": f_largest,
+                "sigma_p": sigma_p, "n_active": n}
+
+    def _c2_observe_state(self, state, rel_state):
+        """Compute swarm stats for the given state, append to the C2 buffers,
+        and evaluate the fire condition (offline-judge rolling(W) semantics:
+        last W samples including current)."""
+        e = self.config.env
+        st = self._compute_swarm_stats(state, rel_state)
+        self._swarm_stats = st
+        self._c2_phis.append(st["phi"])
+        self._c2_singles.append(st["n_comp"] == 1)
+        self._c2_sps.append(st["sigma_p"])
+        fired = False
+        if (len(self._c2_phis) == e.c2_align_window
+                and min(self._c2_phis) > e.c2_phi_goal
+                and len(self._c2_singles) == e.c2_window
+                and all(self._c2_singles)
+                and len(self._c2_sps) == e.c2_window):
+            sps_mean = sum(self._c2_sps) / len(self._c2_sps)
+            if sps_mean > 0 and (max(self._c2_sps) - min(self._c2_sps)) / sps_mean < e.c2_eps:
+                fired = True
+        self._c2_fired_now = fired
+
     def get_extra_info(self, info, state, rel_state, control_inputs, rewards, done):
+        # C2 support: expose per-step swarm stats + success flags for
+        # monitoring/callbacks (state here is the POST-step state).
+        if self._c2_stats_needed() and self._swarm_stats is not None:
+            st = self._swarm_stats
+            info["c2_phi"] = st["phi"]
+            info["c2_f_largest"] = st["f_largest"]
+            info["c2_n_comp"] = st["n_comp"]
+            if self._c2_termination_active():
+                info["c2_success"] = bool(self._c2_fired_now)
+                if self._c2_fired_now:
+                    # Number of env steps taken == offline judge's t_fire index
+                    # (time_step is pre-increment here).
+                    info["t_conv"] = self.time_step + 1
         w_align = self.config.env.acs_train_w_align
         if w_align > 0 and self.continuous_action and hasattr(self, 'current_action'):
             action = self.current_action.astype(np.float64)
@@ -1312,6 +1479,38 @@ class NeighborSelectionFlockingEnv(gym.Env):
         :return: custom_reward
         """
         if self.config.env.is_training and self.config.env.task_type=='acs':
+            if self.config.env.reward_mode == "c2_shaping":
+                # C2-shaped reward (study acs-c2-train): level-free cohesion +
+                # alignment shaping, control cost, one-time success bonus.
+                # Calibrated to legacy per-step magnitudes: two-cluster state
+                # (f_largest=0.5) -> pos term -1.0; phi=0.3 -> vel term -0.092.
+                e = self.config.env
+                st = self._swarm_stats  # post-step state, set in _c2_observe_state
+                pos_term = - e.c2_w_pos * (1.0 - st["f_largest"]) ** 2
+                vel_term = - e.c2_w_vel * max(e.c2_phi_goal - st["phi"], 0.0) ** 2
+
+                # Control cost: mean per-agent raw reward plus cruise refund
+                # (identical construction to the legacy branch below).
+                rho = self.config.control.rho
+                control_cost = rewards.sum() / self.num_agents
+                control_cost = control_cost + (rho * self.config.env.dt)
+                ctrl_term = e.c2_w_ctrl * control_cost
+
+                # Connection ratio bookkeeping for logging (same as legacy branch)
+                if hasattr(self, 'current_action'):
+                    padding_mask = state["padding_mask"]
+                    N = int(padding_mask.sum())
+                    if N > 1:
+                        real_edges = self.current_action[padding_mask][:, padding_mask]
+                        num_edges = float(real_edges.sum()) - N
+                        max_edges = N * (N - 1)
+                        self._conn_ratio = num_edges / max_edges
+                    else:
+                        self._conn_ratio = 0.0
+
+                bonus = e.c2_success_bonus if self._c2_fired_now else 0.0
+                return pos_term + vel_term + ctrl_term + bonus
+
             # Get spatial entropy errors
             std_pos = self.spatial_entropy_hist[self.time_step]  # scalar
             std_pos_target = self.config.env.entropy_p_goal - 2.5

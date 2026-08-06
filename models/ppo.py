@@ -62,6 +62,26 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             self.pa_credit_alpha = cfg.get("pa_credit_alpha", 1.0)
             self.pa_replace_ppo = cfg.get("pa_replace_ppo", False)
             self.dist_aux_coef = cfg.get("dist_aux_coef", 0.0)
+            # --- Selection-head variants (study acs-c2-train) ---
+            #   "legacy":    exact old behavior (top_k / hard_top_k / plain / continuous).
+            #   "bernoulli": plain per-edge binary logits (same code path as legacy
+            #                with top_k=None); named for config explicitness.
+            #   "threshold": per-agent learned threshold tau_i over pair scores;
+            #                s_ij = logit_scale*(scale_factor*att_ij - tau_i).
+            self.selection_head = cfg.get("selection_head", "legacy")
+            assert self.selection_head in ("legacy", "bernoulli", "threshold"), \
+                f"selection_head must be legacy/bernoulli/threshold; got {self.selection_head!r}"
+            self.logit_scale = cfg.get("logit_scale", 10.0)
+            if self.selection_head != "legacy":
+                assert not self.continuous_action and self.top_k is None and not self.hard_top_k, \
+                    "bernoulli/threshold heads require continuous_action=False, top_k=None, hard_top_k=False"
+            # dist_aux rework: configurable K (was hardcoded 10) + annealable
+            # coefficient (mutated by callbacks on the policy's model/towers).
+            self.dist_aux_k = cfg.get("dist_aux_k", 10)
+            self.dist_aux_schedule = cfg.get("dist_aux_schedule", None)
+            self.dist_aux_coef_current = self.dist_aux_coef
+            # Global swarm-stats conditioning (obs key "global_stats", (4,))
+            self.use_global_stats = cfg.get("use_global_stats", False)
             self._pretrained_weights_path = cfg.get("pretrained_weights_path", None)
             self.aux_enabled = cfg["aux_enabled"] if "aux_enabled" in cfg else False
             self.aux_loss_coef = cfg["aux_loss_coef"] if "aux_loss_coef" in cfg else 0.1
@@ -166,7 +186,20 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             decoder=decoder,
             generator=generator,
             d_embed_context=d_embed_context,
+            global_stats_dim=4 if self.use_global_stats else 0,
         )
+
+        # 2b. Per-agent threshold head (selection_head == "threshold" only).
+        # Zero-init weight; bias from threshold_bias_init (default 0.0 -> tau=0,
+        # p ~ 0.5 per edge at init). A NEGATIVE bias (e.g. -0.1 in scaled-att
+        # units) starts the bar below the att distribution: sampling is dense
+        # (p ~ 0.9) and the argmax readout starts near fully-connected — the
+        # known-feasible end — so pruning is learned downward from success.
+        if self.selection_head == "threshold":
+            self.threshold_bias_init = cfg.get("threshold_bias_init", 0.0)
+            self.threshold_head = nn.Linear(d_embed_context, 1)
+            nn.init.zeros_(self.threshold_head.weight)
+            nn.init.constant_(self.threshold_head.bias, self.threshold_bias_init)
 
         # 3. Define value network
         self.values = None
@@ -179,6 +212,12 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
                 generator=RawAttentionScoreGeneratorPlaceholder(),
                 d_embed_context=d_embed_context,
             )
+
+        # 3b. Global-stats conditioning of the critic's pooled vector
+        # (applies to both share_layers cases; actor-side conditioning lives
+        # inside NeighborSelectorTorch via global_stats_dim).
+        if self.use_global_stats:
+            self.values_gs_proj = nn.Linear(d_embed_context + 4, d_embed_context)
 
         self.value_branch = nn.Sequential(
             nn.Linear(in_features=d_embed_context, out_features=d_embed_context),
@@ -255,6 +294,10 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             ranks = dist_sq_nodiag.argsort(dim=-1).argsort(dim=-1).float()
             self._distance_bias = self.distance_bias_scale * (K - 0.5 - ranks)
 
+        if self.selection_head == "threshold":
+            # Per-agent selection bar from the agent's pooled context.
+            self._tau = self.threshold_head(per_agent_h_c_N)  # (B, N, 1)
+
         x = self.attention_scores_to_logits(att)  # (batch_size, num_agents_max * num_agents_max * 2)
         self._cached_logits = x
         if self.dist_aux_coef > 0:
@@ -267,6 +310,10 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
         else:
             critic_out = self.critic(obs_dict)
             self.values = critic_out[1].squeeze(1)              # (batch_size, d_embed_context)
+
+        if self.use_global_stats:
+            gs = obs_dict["global_stats"].to(self.values.dtype)  # (B, 4)
+            self.values = self.values_gs_proj(torch.cat([self.values, gs], dim=-1))
 
         if self.aux_enabled:
             # Cache live (gradient-bearing) features for the active aux head. Same lifecycle as
@@ -302,6 +349,19 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
 
         if self.distance_bias_scale > 0 and hasattr(self, '_distance_bias'):
             attention_scores = attention_scores + self._distance_bias
+
+        if self.selection_head == "threshold" and not self.continuous_action:
+            # Per-agent threshold selection: an edge is selected when its
+            # (scaled) attention score clears agent i's learned bar tau_i.
+            # logit_scale sets decisiveness per unit margin (10 -> margin 0.1
+            # gives p~0.88) WITHOUT the ±20 saturation of the old hard-top-K
+            # path: gradients d(logp)/d(att) and d(logp)/d(tau) stay alive.
+            s = self.logit_scale * (attention_scores - self._tau)  # (B, N, N)
+            # Diagonal (self-loop) forced selected, same mechanism as the
+            # plain binary path below; masked entries arrive at -1e8 already.
+            s = s + torch.diag_embed(s.new_full((num_agents_max,), 1e9))
+            z_concatenated = torch.cat((-s.unsqueeze(-1), s.unsqueeze(-1)), dim=-1)
+            return z_concatenated.reshape(batch_size, num_agents_max * num_agents_max * 2)
 
         if self.hard_top_k and self.top_k is not None and not self.continuous_action:
             # HARD top-K binary selection. Each agent i selects EXACTLY top_k of its
@@ -438,14 +498,42 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
             edge_mask = edge_mask * (1.0 - diag)  # exclude diagonal
 
             # Rank-based target: K nearest get positive score, rest get negative
-            K = 10
+            K = self.dist_aux_k
             dist_sq_masked = dist_sq + (1.0 - edge_mask) * 1e9 + diag * 1e9
             ranks = dist_sq_masked.argsort(dim=-1).argsort(dim=-1).float()
             target_score = (K - 0.5 - ranks) / K  # +0.95 for rank 0, -0.05 for rank K, ...
             valid_count = edge_mask.sum().clamp(min=1.0)
             dist_aux = ((att - target_score) ** 2 * edge_mask).sum() / valid_count
-            total_aux = total_aux + self.dist_aux_coef * dist_aux
+            # Annealable coefficient (callbacks mutate dist_aux_coef_current on
+            # the policy's model AND its GPU towers; falls back to the static coef).
+            dist_aux_coef = getattr(self, "dist_aux_coef_current", self.dist_aux_coef)
+            total_aux = total_aux + dist_aux_coef * dist_aux
             self._last_dist_aux_loss = dist_aux.detach()
+
+        # --- Surface aux/saturation scalars through tower_stats ---
+        # model.metrics() does not reach results on the 2.1.0 multi-GPU path;
+        # tower_stats -> (GradLogging)stats_fn is the reliable route. Values
+        # must be tensors (get_tower_stats stacks them).
+        ts = getattr(self, "tower_stats", None)
+        if ts is not None:
+            if self._last_aux_loss is not None:
+                ts["aux_mse"] = self._last_aux_loss
+            if self._last_dist_aux_loss is not None:
+                ts["dist_aux"] = self._last_dist_aux_loss
+                ts["dist_aux_coef_current"] = torch.tensor(
+                    float(getattr(self, "dist_aux_coef_current", self.dist_aux_coef)))
+            if not self.continuous_action and hasattr(self, "_cached_logits") \
+                    and getattr(self, "_aux_padding_mask", None) is not None:
+                with torch.no_grad():
+                    N = self._num_agents_max
+                    lg = self._cached_logits.view(-1, N, N, 2)
+                    p_sel = torch.softmax(lg, dim=-1)[..., 1]  # (B, N, N)
+                    pad = self._aux_padding_mask
+                    m = pad.unsqueeze(2) * pad.unsqueeze(1)
+                    m = m * (1.0 - torch.eye(N, device=m.device).unsqueeze(0))
+                    denom = m.sum().clamp(min=1.0)
+                    # 0.0 = maximally stochastic, 0.5 = fully saturated
+                    ts["sat_p_dev"] = ((p_sel - 0.5).abs() * m).sum() / denom
 
         # --- Per-agent credit assignment ---
         pa_loss = torch.tensor(0.0, device=policy_loss[0].device)
@@ -523,7 +611,8 @@ class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
 
 
 class NeighborSelectorTorch(nn.Module):
-    def __init__(self, src_embed, encoder, decoder, generator, d_embed_context):
+    def __init__(self, src_embed, encoder, decoder, generator, d_embed_context,
+                 global_stats_dim=0):
 
         super().__init__()
 
@@ -535,8 +624,11 @@ class NeighborSelectorTorch(nn.Module):
         self.generator = generator
         self.d_embed_context = d_embed_context
 
-        # Custom layers, if needed
-        #
+        # Optional global swarm-stats conditioning of the decoder query context
+        # (study acs-c2-train): h_c <- Linear([h_c || global_stats]).
+        # global_stats_dim=0 (default) keeps the legacy architecture untouched.
+        self.gs_proj = (nn.Linear(d_embed_context + global_stats_dim, d_embed_context)
+                        if global_stats_dim > 0 else None)
 
     def forward(self, obs_dict: Dict[str, torch.Tensor]):
         """
@@ -595,6 +687,14 @@ class NeighborSelectorTorch(nn.Module):
         expanded_is_from_my_env = is_from_my_env.unsqueeze(0).expand(num_agents_max, -1)  # (num_agents_max, batch_size)
         flat_is_from_my_env = expanded_is_from_my_env.reshape(num_agents_max * batch_size)
 
+        # global_stats: same (B,) -> (i*b) replication as is_from_my_env, but
+        # feature-dim 4. Only consumed when gs_proj is configured.
+        flat_global_stats = None
+        if self.gs_proj is not None and "global_stats" in obs_dict:
+            gs = obs_dict["global_stats"]  # (batch_size, 4)
+            flat_global_stats = gs.unsqueeze(0).expand(num_agents_max, -1, -1) \
+                .reshape(num_agents_max * batch_size, -1)
+
         # ------------------------------------------------------------
         # 3) Call local_forward once on the flattened data
         #
@@ -610,7 +710,8 @@ class NeighborSelectorTorch(nn.Module):
             flat_network,  # (batch_size * num_agents_max, num_agents_max)
             flat_padding_mask_for_neighbors,  # (batch_size * num_agents_max, num_agents_max)
             flat_is_from_my_env,  # (batch_size * num_agents_max,)
-            flat_local_padding_flags  # (batch_size * num_agents_max,)
+            flat_local_padding_flags,  # (batch_size * num_agents_max,)
+            global_stats=flat_global_stats,  # (batch_size * num_agents_max, 4) or None
         )
         # sub_att_scores_flat  => (batch_size * num_agents_max, num_agents_max)
         # h_c_N_flat           => (batch_size * num_agents_max, 1, d_embed_context)
@@ -671,6 +772,7 @@ class NeighborSelectorTorch(nn.Module):
             padding_mask,
             is_from_my_env,
             local_padding_flags,
+            global_stats=None,
     ):
         """
         :param local_agent_info: (batch_size, num_agents_max, obs_dim)
@@ -678,6 +780,7 @@ class NeighborSelectorTorch(nn.Module):
         :param padding_mask:     (batch_size, num_agents_max)
         :param is_from_my_env:   (batch_size,)
         :param local_padding_flags: (batch_size,)  # Checks if the agent of each batch is padded or not in local_forward
+        :param global_stats:     (batch_size, 4) or None — swarm summary for gs_proj conditioning
         :return: sub_att_scores: (batch_size, num_agents_max)
         """
         batch_size, num_agents_max, obs_dim = local_agent_info.shape
@@ -718,6 +821,12 @@ class NeighborSelectorTorch(nn.Module):
                 use_embeddings_mask=True,
                 debug=True
             )  # (n_non_padded, 1, d_embed_context)
+
+            # Global swarm-stats conditioning of the context (query) vector
+            if self.gs_proj is not None and global_stats is not None:
+                gs_np = global_stats[non_padded_mask].to(h_c_N_np.dtype)  # (n_non_padded, 4)
+                h_c_N_np = self.gs_proj(
+                    torch.cat([h_c_N_np, gs_np.unsqueeze(1)], dim=-1))  # (n_non_padded, 1, d_ctx)
 
             # Decoding
             decoder_out_np = self.decode(h_c_N_np, encoder_out, tgt_mask, src_tgt_mask.unsqueeze(1))

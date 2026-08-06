@@ -38,7 +38,10 @@ class GradLoggingPPOTorchPolicy(PPOTorchPolicy):
     @override(TorchPolicyV2)
     def stats_fn(self, train_batch):
         stats = super().stats_fn(train_batch)
-        for k in ("gnorm_total_preclip", "gnorm_actor_preclip", "gnorm_critic_preclip"):
+        for k in ("gnorm_total_preclip", "gnorm_actor_preclip", "gnorm_critic_preclip",
+                  # study acs-c2-train: aux losses + saturation monitor stashed
+                  # by NeighborSelectionPPORLlib.custom_loss into tower_stats
+                  "aux_mse", "dist_aux", "dist_aux_coef_current", "sat_p_dev"):
             try:
                 stats[k] = float(torch.mean(torch.stack(self.get_tower_stats(k))))
             except AssertionError:
