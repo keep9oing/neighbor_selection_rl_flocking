@@ -249,3 +249,7 @@ good-policy 세트 판정 중앙값 ~550스텝, 1000스텝 내 96%, **1500스텝
 
 원자료: `data/main/*.npz` (1152런, 런당 전 시계열 15종 + 위치 스냅샷),
 요약: `data/summary_main.csv`, `data/criteria_main.csv`. 모두 gitignore 대상.
+
+> **후속 스터디**: C2 기준 하 재학습(비포화 선택 헤드, 적응성 실증)은
+> `studies/acs-c2-train/` — REPORT_KO.md 참조 (A it60: 31/32, J_med 156;
+> FC 대비 p=3e-4; k=12와 동급 매치; 병합기 rank-dev 0.36-0.40).
