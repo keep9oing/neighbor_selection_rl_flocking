@@ -100,6 +100,18 @@ class EnvConfig(BaseModel):
     c2_w_ctrl: float = 0.1                # control-cost weight
     c2_success_bonus: float = 10.0        # one-time reward at C2 fire
     expose_global_stats: bool = False     # adds obs key "global_stats" (4,)
+    # --- Scale-robustness support (study acs-robust-train) ---
+    # initial_position_bound_pool: when set, each episode samples its initial
+    # scale L uniformly from this list at reset (None = legacy fixed
+    # control.initial_position_bound). Requires task acs + non-periodic, and
+    # either c2 termination or fixed episode length (the legacy termination
+    # thresholds are absolute and would be meaningless across scales).
+    # obs_position_scale: how relative positions are normalized in the obs.
+    #   "legacy": divide by (episode L)/2 (identical to old behavior when the
+    #             pool is off). "r0_log": scale-free d -> unit(d)*log1p(|d|/r0)
+    #             (r0-anchored; far field log-compressed; range ~ legacy's).
+    initial_position_bound_pool: Optional[List[float]] = None
+    obs_position_scale: str = "legacy"    # "legacy" | "r0_log"
 
 
 class Config(BaseModel):
@@ -360,6 +372,23 @@ class NeighborSelectionFlockingEnv(gym.Env):
             assert not self.config.env.periodic_boundary, \
                 "C2 termination/shaping/global-stats do not support periodic_boundary"
 
+        # Scale-robustness validation (study acs-robust-train)
+        pool = self.config.env.initial_position_bound_pool
+        if pool is not None:
+            assert len(pool) >= 1 and all(b > 0 for b in pool), \
+                f"initial_position_bound_pool must be non-empty positives, got {pool}"
+            assert self.config.env.task_type == "acs" and not self.config.env.periodic_boundary, \
+                "initial_position_bound_pool supports only task acs, non-periodic"
+            assert (self.config.env.termination_mode == "c2"
+                    or self.config.env.use_fixed_episode_length), \
+                "initial_position_bound_pool requires c2 termination or fixed episode length " \
+                "(legacy termination thresholds are absolute-scale)"
+        assert self.config.env.obs_position_scale in ("legacy", "r0_log"), \
+            f"obs_position_scale must be 'legacy' or 'r0_log', got '{self.config.env.obs_position_scale}'"
+        if self.config.env.obs_position_scale == "r0_log":
+            assert not self.config.env.periodic_boundary, \
+                "obs_position_scale='r0_log' does not support periodic_boundary"
+
         # Auxiliary target validation
         if self.config.env.expose_aux_target:
             # _get_centralized_obs writes a 4-dim row into a (num_agents_max, obs_dim) array,
@@ -379,6 +408,18 @@ class NeighborSelectionFlockingEnv(gym.Env):
         print(pretty_print(self.config.dict()))
         # print(self.config.model_dump())
         print('----------------------------------------------------')
+
+    @property
+    def episode_position_bound(self):
+        """Per-episode initial scale L: sampled from initial_position_bound_pool
+        at reset when the pool is set; otherwise the static control value.
+        (custom_reset inherits the value sampled by its internal dummy reset.)"""
+        L = getattr(self, "_episode_L", None)
+        return L if L is not None else self.config.control.initial_position_bound
+
+    def _sample_episode_bound(self):
+        pool = self.config.env.initial_position_bound_pool
+        self._episode_L = float(self.np_random.choice(pool)) if pool else None
 
     def custom_reset(self, p_, v_, th_, num_agents_max=None, comm_range=None):
         """
@@ -458,9 +499,12 @@ class NeighborSelectionFlockingEnv(gym.Env):
         padding_mask[:self.num_agents] = True
 
         # Init the state: agent_states [x,y,vx,vy,theta], neighbor_masks[T/F (n,n)], padding_mask[T/F (n)]
+        # Sample this episode's initial scale (no-op unless the pool is set;
+        # drawn from np_random in fixed order so seed -> (L, init) is stable)
+        self._sample_episode_bound()
         # # Generate initial agent states
         p = np.zeros((self.num_agents_max, 2), dtype=np.float64)  # (num_agents_max, 2)
-        l2 = self.config.control.initial_position_bound / 2
+        l2 = self.episode_position_bound / 2
         p[:self.num_agents, :] = self.np_random.uniform(-l2, l2, size=(self.num_agents, 2))
         th = np.zeros(self.num_agents_max, dtype=np.float64)  # (num_agents_max, )
         th[:self.num_agents] = self.np_random.uniform(-np.pi, np.pi, size=(self.num_agents,))
@@ -1137,9 +1181,13 @@ class NeighborSelectionFlockingEnv(gym.Env):
                 # _c2_observe_state just before every get_obs call.
                 st = self._swarm_stats
                 assert st is not None, "expose_global_stats: swarm stats not computed for this state"
-                l2 = self.config.control.initial_position_bound / 2.0
+                if self.config.env.obs_position_scale == "r0_log":
+                    # same scale system as the local view: r0-anchored, logged
+                    sp_term = np.log1p(st["sigma_p"] / self.config.control.r0)
+                else:
+                    sp_term = st["sigma_p"] / (self.episode_position_bound / 2.0)
                 obs["global_stats"] = np.array(
-                    [st["phi"], st["f_largest"], st["n_comp"] / st["n_active"], st["sigma_p"] / l2],
+                    [st["phi"], st["f_largest"], st["n_comp"] / st["n_active"], sp_term],
                     dtype=np.float64,
                 )
             return obs
@@ -1189,10 +1237,17 @@ class NeighborSelectionFlockingEnv(gym.Env):
         active_agents_rel_headings = active_agents_rel_headings[:, :, np.newaxis]  # (num_agents, num_agents, 1)
 
         # (2) Map periodic to continuous space if necessary: [x, y] -> [cos(x), sin(x), cos(y), sin(y)]
-        l = self.config.control.initial_position_bound
+        l = self.episode_position_bound
         if self.config.env.periodic_boundary:
             # (num_agents, num_agents, 4)
             active_agents_rel_positions = map_periodic_to_continuous_space(active_agents_rel_positions, l, l)
+        elif self.config.env.obs_position_scale == "r0_log":
+            # Scale-free normalization: d -> unit(d) * log1p(|d|/r0).
+            # Direction exact; magnitude r0-anchored, far field log-compressed.
+            # Self-pairs (r=0) stay (0,0) via the max() guard.
+            r0 = self.config.control.r0
+            r = np.linalg.norm(active_agents_rel_positions, axis=2, keepdims=True)  # (n, n, 1)
+            active_agents_rel_positions = active_agents_rel_positions * (np.log1p(r / r0) / np.maximum(r, 1e-12))
         else:  # needs normalization
             # (num_agents, num_agents, 2)
             active_agents_rel_positions = active_agents_rel_positions / (l/2.0)
@@ -1256,9 +1311,14 @@ class NeighborSelectionFlockingEnv(gym.Env):
         centralized_obs = np.zeros((self.num_agents_max, self.config.env.obs_dim), dtype=np.float64)
         centralized_obs[padding_mask] = active_pvu  # (num_agents_max, obs_dim)
 
-        # # Normalize by [init_bound/2, init_bound/2, 1, 1] (same as legacy)
-        init_bound = self.config.control.initial_position_bound
-        centralized_obs[:, :2] /= (init_bound / 2)
+        # # Normalize positions in the same scale system as the ego-centric obs
+        if self.config.env.obs_position_scale == "r0_log":
+            r0 = self.config.control.r0
+            r = np.linalg.norm(centralized_obs[:, :2], axis=1, keepdims=True)
+            centralized_obs[:, :2] *= (np.log1p(r / r0) / np.maximum(r, 1e-12))
+        else:
+            # legacy: [init_bound/2, init_bound/2, 1, 1] with the episode's bound
+            centralized_obs[:, :2] /= (self.episode_position_bound / 2)
 
         # Return centralized obs directly as (num_agents_max, obs_dim)
         # No tiling - all agents share the same global view
