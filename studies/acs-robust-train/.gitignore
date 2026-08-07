@@ -1,0 +1,7 @@
+data/
+figs/
+logs/
+*.npz
+*.png
+*.log
+__pycache__/
