@@ -1,0 +1,106 @@
+=== 0. sanity: r2 k12 n=500 reproduction ===
+k12 L250: success 460/500 (published 460) OK
+k12 L500: success 455/500 (published 455) OK
+
+=== 1. frontier table (n=500 unless noted) ===
+     arm   n  fails  fail_pct  wilson_lo  wilson_hi    J_med    J_q90   CVaR10
+k12_L125 500     20       4.0        2.6        6.1    147.7    244.0    376.8
+k13_L125 500     21       4.2        2.8        6.3    144.9    238.6    341.2
+k14_L125 500     17       3.4        2.1        5.4    147.3    240.7    332.7
+k16_L125 500     24       4.8        3.2        7.0    166.0    259.6    318.7
+k18_L125 500     49       9.8        7.5       12.7    206.2    341.9    419.7
+k19_L125 500      0       0.0        0.0        0.8    236.7    450.6    559.6
+ C1_L125 500     20       4.0        2.6        6.1    139.3    190.1    273.0
+ R1_L125 500      0       0.0        0.0        0.8    185.5    289.7    358.1
+k12_L250 500     40       8.0        5.9       10.7    160.3    241.0    316.4
+k13_L250 500     25       5.0        3.4        7.3    161.6    246.8    353.3
+k14_L250 500     39       7.8        5.8       10.5    161.0    253.0    391.3
+k16_L250 500     51      10.2        7.8       13.2    162.7    278.0    360.9
+k18_L250 500     69      13.8       11.1       17.1    183.3    321.2    411.8
+k19_L250 500      0       0.0        0.0        0.8    199.9    423.8    520.0
+ C1_L250 500      1       0.2        0.0        1.1    158.6    237.6    302.6
+ R1_L250 500      0       0.0        0.0        0.8    192.9    264.0    308.4
+A60_L250 500     11       2.2        1.2        3.9    155.7    211.3    319.7
+k12_L500 500     45       9.0        6.8       11.8    166.3    233.0    348.9
+k13_L500 500     36       7.2        5.2        9.8    167.3    241.1    365.1
+k14_L500 500     51      10.2        7.8       13.2    161.3    234.6    375.2
+k16_L500 500     75      15.0       12.1       18.4    169.8    254.3    328.8
+k18_L500 500     46       9.2        7.0       12.1    194.8    374.1    441.3
+k19_L500 500      0       0.0        0.0        0.8    226.4    446.4    533.9
+ C1_L500 500      2       0.4        0.1        1.4    205.5    318.7    467.7
+ R1_L500 500      1       0.2        0.0        1.1    236.4    312.9    489.5
+
+=== 2. H-A verdict (pre-registered) ===
+  arm k13: fails L250=25 L500=36 -> criterion(i) not met
+  arm k14: fails L250=39 L500=51 -> criterion(i) not met
+  arm k16: fails L250=51 L500=75 -> criterion(i) not met
+  arm k18: fails L250=69 L500=46 -> criterion(i) not met
+R1 vs k13 L250 n500          n=475 mean  +21.9(t_p 1.96e-08) med  +26.3(w_p 3.28e-19) worse 346/475 (s_p 5.88e-24) q10/90   -54/ +101 typ +60.5 tail -139.5 succ 500/475 of 500 (mcn_p 5.96e-08)
+R1 vs k14 L250 n500          n=461 mean  +15.6(t_p 0.00085) med  +27.6(w_p 1.08e-15) worse 325/461 (s_p 6.47e-19) q10/90   -70/  +98 typ +59.8 tail -185.6 succ 500/461 of 500 (mcn_p 3.64e-12)
+R1 vs k16 L250 n500          n=449 mean  +16.1(t_p 0.000134) med  +25.5(w_p 1.21e-11) worse 316/449 (s_p 2.97e-18) q10/90   -78/  +96 typ +60.4 tail -159.1 succ 500/449 of 500 (mcn_p 8.88e-16)
+R1 vs k18 L250 n500          n=431 mean   -4.4(t_p 0.342) med  +13.5(w_p 0.133) worse 251/431 (s_p 0.000729) q10/90  -125/  +90 typ +51.2 tail -203.0 succ 500/431 of 500 (mcn_p 3.39e-21)
+R1 vs k12 L250 n500          n=460 mean  +26.1(t_p 3.01e-12) med  +27.2(w_p 9.18e-23) worse 336/460 (s_p 1.21e-23) q10/90   -42/ +103 typ +58.0 tail  -95.3 succ 500/460 of 500 (mcn_p 1.82e-12)
+  H-A for R1@L250: SURVIVES
+R1 vs k13 L500 n500          n=463 mean  +65.8(t_p 1.01e-15) med  +67.3(w_p 6.62e-48) worse 411/463 (s_p 2.47e-70) q10/90   -10/ +140 typ+100.7 tail -115.7 succ 499/464 of 500 (mcn_p 5.53e-10)
+R1 vs k14 L500 n500          n=448 mean  +74.8(t_p 2.32e-12) med  +68.3(w_p 5.49e-49) worse 395/448 (s_p 9.94e-66) q10/90   -11/ +142 typ+128.7 tail -132.2 succ 499/449 of 500 (mcn_p 2.35e-14)
+R1 vs k16 L500 n500          n=424 mean  +73.5(t_p 2.14e-12) med  +63.5(w_p 3.43e-43) worse 358/424 (s_p 1.27e-49) q10/90   -21/ +142 typ+109.0 tail  -17.7 succ 499/425 of 500 (mcn_p 2.04e-21)
+R1 vs k18 L500 n500          n=453 mean  +34.9(t_p 0.000538) med  +43.3(w_p 1.25e-09) worse 316/453 (s_p 2.34e-17) q10/90  -129/ +120 typ +82.7 tail -188.7 succ 499/454 of 500 (mcn_p 6.82e-13)
+R1 vs k12 L500 n500          n=454 mean  +75.7(t_p 1.25e-12) med  +68.2(w_p 5.17e-52) worse 405/454 (s_p 8.58e-71) q10/90    -4/ +148 typ+114.3 tail -107.1 succ 499/455 of 500 (mcn_p 1.34e-12)
+  H-A for R1@L500: SURVIVES
+C1 vs k13 L250 n500          n=474 mean   -7.9(t_p 0.0617) med   -1.7(w_p 0.231) worse 232/474 (s_p 0.679) q10/90   -88/  +73 typ +33.1 tail -177.7 succ 499/475 of 500 (mcn_p 8.05e-07)
+C1 vs k14 L250 n500          n=460 mean  -15.6(t_p 0.00113) med   -3.5(w_p 0.011) worse 216/460 (s_p 0.208) q10/90   -82/  +61 typ +29.1 tail -214.4 succ 499/461 of 500 (mcn_p 7.46e-11)
+C1 vs k16 L250 n500          n=448 mean  -13.5(t_p 0.00164) med   -4.8(w_p 0.0023) worse 203/448 (s_p 0.0526) q10/90  -110/  +66 typ +31.6 tail -185.0 succ 499/449 of 500 (mcn_p 2.35e-14)
+C1 vs k18 L250 n500          n=430 mean  -31.3(t_p 3.47e-10) med  -17.7(w_p 2.79e-09) worse 178/430 (s_p 0.000418) q10/90  -156/  +63 typ +27.2 tail -234.2 succ 499/431 of 500 (mcn_p 1.2e-19)
+C1 vs k12 L250 n500          n=459 mean   -3.8(t_p 0.361) med   -1.9(w_p 0.241) worse 224/459 (s_p 0.641) q10/90   -84/  +76 typ +31.8 tail -154.9 succ 499/460 of 500 (mcn_p 3.82e-11)
+  H-A for C1@L250: SURVIVES
+C1 vs k13 L500 n500          n=462 mean  +46.6(t_p 3.34e-13) med  +39.5(w_p 3.34e-29) worse 363/462 (s_p 1.85e-36) q10/90   -44/ +152 typ +84.8 tail -130.5 succ 498/464 of 500 (mcn_p 5.4e-09)
+C1 vs k14 L500 n500          n=447 mean  +52.8(t_p 2.46e-13) med  +41.7(w_p 2.37e-34) worse 353/447 (s_p 2.44e-36) q10/90   -30/ +152 typ +89.1 tail -125.4 succ 498/449 of 500 (mcn_p 3.18e-13)
+C1 vs k16 L500 n500          n=423 mean  +43.2(t_p 1.03e-13) med  +35.6(w_p 1.58e-25) worse 315/423 (s_p 1.44e-24) q10/90   -39/ +140 typ +77.1 tail  -71.7 succ 498/425 of 500 (mcn_p 3.98e-20)
+C1 vs k18 L500 n500          n=453 mean  +12.8(t_p 0.0756) med  +20.0(w_p 0.0146) worse 270/453 (s_p 5.07e-05) q10/90  -161/ +140 typ +84.2 tail -215.1 succ 498/454 of 500 (mcn_p 1.34e-12)
+C1 vs k12 L500 n500          n=453 mean  +49.0(t_p 5.58e-14) med  +38.0(w_p 3.12e-36) worse 357/453 (s_p 2.2e-36) q10/90   -31/ +150 typ +87.5 tail -113.6 succ 498/455 of 500 (mcn_p 1.6e-11)
+  H-A for C1@L500: SURVIVES
+H-A OVERALL: SURVIVES (no arm meets (i)+(ii) everywhere)
+
+=== 3. H-B verdict (ratio rule) ===
+C1 vs k7(.65N) N10           n= 30 mean  -67.2(t_p 0.000599) med  -48.4(w_p 0.000872) worse   8/30 (s_p 0.0161) q10/90  -198/  +25 typ  -5.1 tail -270.6 succ 32/30 of 32 (mcn_p 0.5)
+R1 vs k7(.65N) N10           n= 30 mean  -29.3(t_p 0.128) med   -3.3(w_p 0.309) worse  15/30 (s_p 1) q10/90  -154/  +82 typ +44.8 tail -229.8 succ 32/30 of 32 (mcn_p 0.5)
+  b1 (C1 beats k7@N10): med dJ -48.4 w_p 0.000872, McNemar b=0 cc=2 p=0.5 -> MET
+C1 vs k26(.65N) N40          n= 30 mean  +28.0(t_p 0.254) med  +22.6(w_p 0.00761) worse  23/30 (s_p 0.00522) q10/90   -25/ +126 typ +69.9 tail -216.8 succ 32/30 of 32 (mcn_p 0.5)
+R1 vs k26(.65N) N40          n= 30 mean  +37.1(t_p 0.0589) med  +47.1(w_p 0.000209) worse  26/30 (s_p 5.95e-05) q10/90    -4/ +115 typ +73.5 tail -178.1 succ 32/30 of 32 (mcn_p 0.5)
+  b3 rule-k reliability + 32-seed J-grid slice (seeds 1000-1031):
+    k13 L125: fails 21/500 (4.2%); 32-slice succ 28/32 J_med 145.1
+    k13 L250: fails 25/500 (5.0%); 32-slice succ 31/32 J_med 168.9
+    k13 L500: fails 36/500 (7.2%); 32-slice succ 29/32 J_med 167.4
+    k14 L125: fails 17/500 (3.4%); 32-slice succ 30/32 J_med 156.9
+    k14 L250: fails 39/500 (7.8%); 32-slice succ 31/32 J_med 170.4
+    k14 L500: fails 51/500 (10.2%); 32-slice succ 30/32 J_med 163.3
+H-B: b1=MET, rule-k unreliable somewhere=YES -> SURVIVES
+
+=== 4. H-C verdict (C1 in-pool insurance) ===
+  L125: C1 fails 20/500; McNemar vs k12 b=18 cc=18 p=1 n.s.
+  L250: C1 fails 1/500; McNemar vs k12 b=1 cc=40 p=3.82e-11 SIG
+  L500: C1 fails 2/500; McNemar vs k12 b=2 cc=45 p=1.6e-11 SIG
+H-C: pooled 23/1500 (1.53%) -> NOT MET
+
+=== 5. extrapolation refs (32 seeds) ===
+  k12 L375: succ 26/32 J_med 179.1
+  k16 L375: succ 25/32 J_med 182.8
+  k19 L375: succ 32/32 J_med 237.8
+  C1 L375: succ 32/32 J_med 178.3
+C1 vs k12 L375 extrap        n= 26 mean   +1.4(t_p 0.904) med   +3.4(w_p 0.635) worse  17/26 (s_p 0.169) q10/90   -60/  +47 typ +28.2 tail  -95.7 succ 32/26 of 32 (mcn_p 0.0312)
+  R1 L375: succ 32/32 J_med 220.3
+R1 vs k12 L375 extrap        n= 26 mean  +52.7(t_p 0.000298) med  +55.0(w_p 0.000321) worse  20/26 (s_p 0.00936) q10/90   -27/ +136 typ +80.8 tail   -2.4 succ 32/26 of 32 (mcn_p 0.0312)
+  A60 L375: succ 31/32 J_med 181.3
+A60 vs k12 L375 extrap       n= 25 mean  +45.2(t_p 0.198) med  +12.8(w_p 0.173) worse  16/25 (s_p 0.23) q10/90   -37/ +101 typ+100.1 tail  -51.0 succ 31/26 of 32 (mcn_p 0.125)
+  k12 L750: succ 26/32 J_med 200.1
+  k16 L750: succ 28/32 J_med 205.4
+  k19 L750: succ 32/32 J_med 304.0
+  C1 L750: succ 29/32 J_med 282.3
+C1 vs k12 L750 extrap        n= 23 mean  +84.4(t_p 0.0931) med  +77.1(w_p 0.00273) worse  21/23 (s_p 6.6e-05) q10/90   +10/ +117 typ+159.9 tail -186.5 succ 29/26 of 32 (mcn_p 0.508)
+  R1 L750: succ 32/32 J_med 313.8
+R1 vs k12 L750 extrap        n= 26 mean  +98.5(t_p 0.00154) med +133.3(w_p 0.00117) worse  23/26 (s_p 8.8e-05) q10/90   -62/ +202 typ+156.1 tail -224.2 succ 32/26 of 32 (mcn_p 0.0312)
+  A60 L750: succ 32/32 J_med 401.0
+A60 vs k12 L750 extrap       n= 26 mean +174.8(t_p 5.09e-07) med +194.2(w_p 5.04e-06) worse  24/26 (s_p 1.05e-05) q10/90   +32/ +316 typ+247.9 tail  -78.5 succ 32/26 of 32 (mcn_p 0.0312)
+
+-> /workspace/studies/acs-robust-r3-stress/data/stress_stats.csv
+WARNS: 0
