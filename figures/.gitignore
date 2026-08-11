@@ -1,0 +1,4 @@
+*.png
+*.npz
+stats.json
+__pycache__/
