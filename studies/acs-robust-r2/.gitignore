@@ -1,0 +1,10 @@
+data/
+figs/
+logs/
+*.npz
+*.png
+*.log
+__pycache__/
+# session artifacts — never committed (round convention)
+KICKOFF_PROMPT_KO.md
+HANDOFF_NEXT_SESSION_KO.md

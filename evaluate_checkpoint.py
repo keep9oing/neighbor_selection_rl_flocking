@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 from envs.env import NeighborSelectionFlockingEnv, load_config
 from models.ppo_centralized import NeighborSelectionPPORLlibCentralized
+from models.ppo import NeighborSelectionPPORLlib
 
 
 def find_latest_checkpoint(exp_dir: str) -> str:
@@ -44,71 +45,74 @@ def find_latest_checkpoint(exp_dir: str) -> str:
     return os.path.join(trial_dir, latest[0])
 
 
-def create_env(config_overrides: dict = None):
+def create_env(config_overrides: dict = None, observation_type: str = "centralized"):
     """Create environment with optional config overrides."""
     default_config_path = "./envs/default_env_config.yaml"
     my_config = load_config(default_config_path)
-    
-    # Default settings for evaluation
-    my_config.env.observation_type = "centralized"
+
+    my_config.env.observation_type = observation_type
     my_config.env.num_agents_pool = [20]
     my_config.env.max_time_steps = 1000
     my_config.env.use_fixed_episode_length = True
     my_config.env.is_training = False
     my_config.env.get_state_hist = False
-    
-    # Apply overrides
+    if observation_type == "ego_centric":
+        my_config.env.expose_aux_target = True
+
     if config_overrides:
         for key, value in config_overrides.items():
             if hasattr(my_config.env, key):
                 setattr(my_config.env, key, value)
-    
+
     env_config = {"seed_id": None, "config": my_config.dict()}
     return NeighborSelectionFlockingEnv(env_config)
 
 
 class RLPolicy:
     """Wrapper for RL policy loaded from checkpoint."""
-    
-    def __init__(self, checkpoint_path: str, env):
+
+    def __init__(self, checkpoint_path: str, env, observation_type: str = "centralized"):
         """Load model weights from checkpoint."""
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Get model config from checkpoint params
+        self.observation_type = observation_type
+
         params_path = os.path.join(os.path.dirname(checkpoint_path), "params.json")
         import json
         with open(params_path, 'r') as f:
             params = json.load(f)
-        
+
         model_config = params.get("model", {}).get("custom_model_config", {})
-        
-        # Create model with same config
+        self.continuous_action = model_config.get("continuous_action", False)
+
         obs_space = env.observation_space
         action_space = env.action_space
-        
-        # Calculate num_outputs based on action space
+
         if hasattr(action_space, 'n'):
             num_outputs = action_space.n
         elif hasattr(action_space, 'nvec'):
-            # MultiDiscrete: N*N binary decisions, each with 2 options
             num_outputs = int(np.sum(action_space.nvec))
         else:
-            # Assume Box action space - get shape
             num_outputs = int(np.prod(action_space.shape) * 2)
-        
-        self.model = NeighborSelectionPPORLlibCentralized(
+
+        if observation_type == "ego_centric":
+            model_cls = NeighborSelectionPPORLlib
+            model_name = "ego_centric_policy"
+        else:
+            model_cls = NeighborSelectionPPORLlibCentralized
+            model_name = "centralized_policy"
+
+        self.model = model_cls(
             obs_space=obs_space,
             action_space=action_space,
             num_outputs=num_outputs,
             model_config={"custom_model_config": model_config},
-            name="centralized_policy"
+            name=model_name,
         )
         self.model.to(self.device)
-        
-        # Load weights from checkpoint
+
         policy_path = os.path.join(checkpoint_path, "policies", "default_policy")
         self._load_weights(policy_path)
-        
+
         self.model.eval()
     
     def _load_weights(self, policy_path: str):
@@ -139,33 +143,40 @@ class RLPolicy:
     def __call__(self, obs: dict) -> np.ndarray:
         """Compute action from observation."""
         with torch.no_grad():
-            # Convert obs to tensors with batch dimension
-            input_dict = {
-                "obs": {
-                    "local_agent_infos": torch.from_numpy(
-                        obs["local_agent_infos"][np.newaxis]
-                    ).float().to(self.device),
-                    "neighbor_masks": torch.from_numpy(
-                        obs["neighbor_masks"][np.newaxis]
-                    ).float().to(self.device),
-                    "padding_mask": torch.from_numpy(
-                        obs["padding_mask"][np.newaxis]
-                    ).float().to(self.device),
-                }
+            obs_tensors = {
+                "local_agent_infos": torch.from_numpy(
+                    obs["local_agent_infos"][np.newaxis]
+                ).float().to(self.device),
+                "neighbor_masks": torch.from_numpy(
+                    obs["neighbor_masks"][np.newaxis]
+                ).float().to(self.device),
+                "padding_mask": torch.from_numpy(
+                    obs["padding_mask"][np.newaxis]
+                ).float().to(self.device),
             }
-            
-            # Forward pass
+            if "global_agent_infos" in obs:
+                obs_tensors["global_agent_infos"] = torch.from_numpy(
+                    obs["global_agent_infos"][np.newaxis]
+                ).float().to(self.device)
+            if "is_from_my_env" in obs:
+                obs_tensors["is_from_my_env"] = torch.from_numpy(
+                    np.array([obs["is_from_my_env"]])
+                ).float().to(self.device)
+
+            input_dict = {"obs": obs_tensors}
             logits, _ = self.model.forward(input_dict, state=[], seq_lens=None)
-            logits = logits.cpu().numpy()[0]  # Remove batch dim
-            
-            # Convert logits to action
-            # logits shape: (N*N*2,) -> reshape to (N, N, 2)
+            logits = logits.cpu().numpy()[0]
+
             num_agents_max = obs["padding_mask"].shape[0]
-            logits_reshaped = logits.reshape(num_agents_max, num_agents_max, 2)
-            
-            # Sample action: argmax over last dim (0=not select, 1=select)
-            action = np.argmax(logits_reshaped, axis=-1).astype(np.int8)
-            
+            if self.continuous_action:
+                N2 = num_agents_max * num_agents_max
+                mean_logits = logits[:N2]
+                action = 1.0 / (1.0 + np.exp(-mean_logits))  # sigmoid
+                action = action.reshape(num_agents_max, num_agents_max).astype(np.float32)
+            else:
+                logits_reshaped = logits.reshape(num_agents_max, num_agents_max, 2)
+                action = np.argmax(logits_reshaped, axis=-1).astype(np.int8)
+
             return action
 
 
@@ -174,22 +185,21 @@ class PureACSPolicy:
     Pure ACS baseline - no neighbor selection.
     Uses fully connected network (all agents communicate with all).
     """
-    
+
+    def __init__(self, continuous=False):
+        self.continuous = continuous
+
     def __call__(self, obs: dict) -> np.ndarray:
         """Return fully connected action (all 1s with self-loops)."""
         padding_mask = obs['padding_mask']
         num_agents_max = len(padding_mask)
-        
-        # Fully connected: all agents connected to all
-        action = np.ones((num_agents_max, num_agents_max), dtype=np.int8)
-        
-        # Zero out connections to/from padding agents
+        dtype = np.float32 if self.continuous else np.int8
+
+        action = np.ones((num_agents_max, num_agents_max), dtype=dtype)
         padding_mask_2d = padding_mask[:, np.newaxis] & padding_mask[np.newaxis, :]
-        action = action * padding_mask_2d.astype(np.int8)
-        
-        # Ensure self-loops for active agents
-        action[np.arange(num_agents_max), np.arange(num_agents_max)] = padding_mask.astype(np.int8)
-        
+        action = action * padding_mask_2d.astype(dtype)
+        action[np.arange(num_agents_max), np.arange(num_agents_max)] = padding_mask.astype(dtype)
+
         return action
 
 
@@ -222,27 +232,38 @@ def run_episode(env, policy, collect_trajectory=False):
         padding_mask = env.state["padding_mask"].copy()
         trajectory.append((positions, padding_mask))
     
+    edges_per_agent_steps = []
+
     while not done:
         action = policy(obs)
+
+        padding_mask = obs['padding_mask']
+        n_active = int(padding_mask.sum())
+        if n_active > 0:
+            active_idx = np.where(padding_mask)[0]
+            active_action = action[np.ix_(active_idx, active_idx)]
+            off_diag = active_action.sum() - n_active  # subtract self-loops
+            edges_per_agent_steps.append(off_diag / n_active)
+
         obs, reward, done, info = env.step(action)
-        
+
         episode_return += reward
         steps += 1
-        
-        # Collect trajectory
+
         if collect_trajectory:
             positions = env.state["agent_states"][:, :2].copy()
             padding_mask = env.state["padding_mask"].copy()
             trajectory.append((positions, padding_mask))
-        
-        # Collect metrics
+
         if info.get('spatial_entropy') is not None:
             spatial_entropies.append(info['spatial_entropy'])
         if info.get('velocity_entropy') is not None:
             velocity_entropies.append(info['velocity_entropy'])
         if 'original_reward' in info:
-            control_costs.append(-info['original_reward'])  # Reward is negative cost
-    
+            control_costs.append(-info['original_reward'])
+
+    flocking_success = 1.0 if steps < env.config.env.max_time_steps else 0.0
+
     result = {
         'episode_return': episode_return,
         'episode_length': steps,
@@ -252,6 +273,8 @@ def run_episode(env, policy, collect_trajectory=False):
         'velocity_entropy_final': velocity_entropies[-1] if velocity_entropies else np.nan,
         'control_cost_mean': np.mean(control_costs) if control_costs else np.nan,
         'control_cost_total': np.sum(control_costs) if control_costs else np.nan,
+        'mean_edges_per_agent': np.mean(edges_per_agent_steps) if edges_per_agent_steps else np.nan,
+        'flocking_success': flocking_success,
     }
     
     if collect_trajectory:
@@ -380,6 +403,8 @@ def print_comparison(rl_stats: dict, acs_stats: dict):
         ('Spatial Entropy (Mean)', 'spatial_entropy_mean'),
         ('Velocity Entropy (Mean)', 'velocity_entropy_mean'),
         ('Control Cost (Total)', 'control_cost_total'),
+        ('Flocking Success', 'flocking_success'),
+        ('Mean Edges/Agent', 'mean_edges_per_agent'),
     ]
     
     print(f"\n{'Metric':<30} {'RL Policy':<25} {'Pure ACS':<25} {'Diff':<15}")
@@ -434,42 +459,63 @@ def main():
     else:
         checkpoint_path = args.checkpoint
     
-    # Create output directory for trajectory plots
+    # Auto-detect observation type from checkpoint params
+    import json
+    params_path = os.path.join(os.path.dirname(checkpoint_path), "params.json")
+    observation_type = "centralized"
+    if os.path.exists(params_path):
+        with open(params_path, 'r') as f:
+            params = json.load(f)
+        obs_type_from_params = (params.get("env_config", {})
+                                .get("config", {})
+                                .get("env", {})
+                                .get("observation_type"))
+        if obs_type_from_params:
+            observation_type = obs_type_from_params
+    print(f"Detected observation_type: {observation_type}")
+
     save_dir = None
     if args.save_trajectory:
         save_dir = "./evaluate_results"
         os.makedirs(save_dir, exist_ok=True)
         print(f"Trajectory plots will be saved to: {save_dir}")
-    
-    # Create environment
+
+    continuous_action = (params.get("env_config", {})
+                         .get("config", {})
+                         .get("env", {})
+                         .get("continuous_action", False)) if os.path.exists(params_path) else False
+    if continuous_action:
+        print("Detected continuous_action: True")
+
     config_overrides = {
         'num_agents_pool': [args.num_agents],
         'max_time_steps': args.max_steps,
+        'continuous_action': continuous_action,
     }
-    env = create_env(config_overrides)
-    
+    env = create_env(config_overrides, observation_type=observation_type)
+
     print(f"\n{'='*60}")
     print("EVALUATION CONFIGURATION")
     print(f"{'='*60}")
     print(f"  Checkpoint: {checkpoint_path}")
+    print(f"  Observation type: {observation_type}")
     print(f"  Num Episodes: {args.num_episodes}")
     print(f"  Num Agents: {args.num_agents}")
     print(f"  Max Steps: {args.max_steps}")
     print(f"  Seed: {args.seed}")
     print(f"  Save Trajectory: {args.save_trajectory}")
     print(f"{'='*60}\n")
-    
-    # Load RL policy
+
     print("Loading RL policy from checkpoint...")
     try:
-        rl_policy = RLPolicy(checkpoint_path, env)
+        rl_policy = RLPolicy(checkpoint_path, env, observation_type=observation_type)
     except Exception as e:
         print(f"Error loading RL policy: {e}")
         print("Falling back to Pure ACS only evaluation...")
         rl_policy = None
     
     # Create baseline policy
-    acs_policy = PureACSPolicy()
+    acs_policy = PureACSPolicy(continuous=continuous_action)
     
     # For trajectory comparison, we need to run episodes with same initial conditions
     if args.save_trajectory and rl_policy is not None:

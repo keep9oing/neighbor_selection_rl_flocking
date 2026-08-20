@@ -1,3 +1,5 @@
+import copy
+
 import ray
 from ray import tune
 from ray.rllib.models import ModelCatalog
@@ -5,6 +7,9 @@ from ray.tune.registry import register_env
 
 from envs.env import NeighborSelectionFlockingEnv, Config, load_config
 from models.ppo import NeighborSelectionPPORLlib
+from models.beta_dist import TorchContinuousWeightDist
+from callbacks import FlockingCallbacks
+from grad_logging_ppo import GradLoggingPPO
 
 if __name__ == "__main__":
 
@@ -19,9 +24,10 @@ if __name__ == "__main__":
     my_config = load_config(default_config_path)
 
     # environment configs
-    my_config.env.acs_train_w_ctrl = 0.02
+    my_config.env.acs_train_w_ctrl = 0.1
     my_config.env.acs_train_w_pos  = 1.0
     my_config.env.acs_train_w_vel  = 0.2
+    my_config.env.acs_train_w_conn = 0.0
     my_config.env.action_type = "binary_vector"
     my_config.env.agent_name_prefix = "agent_"
     my_config.env.alignment_goal = 0.97
@@ -46,6 +52,8 @@ if __name__ == "__main__":
     my_config.env.seed = None
     my_config.env.task_type = "acs"
     my_config.env.use_fixed_episode_length = True
+    my_config.env.expose_aux_target = True
+    my_config.env.continuous_action = True
 
     # control config:
     my_config.control.beta = 1/3
@@ -59,15 +67,16 @@ if __name__ == "__main__":
     my_config.control.sig = 1.0
     my_config.control.speed = 15.0
 
-    # register your custom environment
+    env_config_dict = my_config.dict()
+
     env_config = {
         "seed_id": 42,
-        "config": my_config.dict(),  # pass dict to save the config
+        "config": env_config_dict,
     }
     env_name = "neighbor_selection_flocking_env"
     register_env(env_name, lambda cfg: NeighborSelectionFlockingEnv(cfg))
 
-    # Set up custom model configuration
+    # model config (all fixed)
     custom_model_config = {
         "d_embed_context": 128,
         "d_embed_input": 128,
@@ -82,53 +91,67 @@ if __name__ == "__main__":
         "n_layers_encoder": 3,
         "norm_eps": 1e-05,
         "num_heads": 4,
-        "scale_factor": 0.002,
+        "scale_factor": 0.10,
         "share_layers": False,
         "use_FNN_in_decoder": True,
         "use_residual_in_decoder": True,
+        "aux_enabled": True,
+        "aux_type": "pair_embedding",
+        "aux_loss_coef": 0.3,
+        "aux_target_dim": 4,
+        "aux_loss_coef_critic": 0.05,
+        "continuous_action": True,
     }
 
-    # register your custom model
+    # register model and action distribution
     model_name = "neighbor_selector_rl"
     ModelCatalog.register_custom_model(model_name, NeighborSelectionPPORLlib)
+    ModelCatalog.register_custom_action_dist("beta_dist", TorchContinuousWeightDist)
 
-    # train
     tune.run(
-        "PPO",
-        name="neighbor_selection_test_260205",
+        GradLoggingPPO,
+        name="continuous_sf10_wctrl01_260527",
         local_dir="/workspace/test_results",
-        # resume=True,
-        checkpoint_freq=8,
-        keep_checkpoints_num=32,
+        checkpoint_freq=10,
+        keep_checkpoints_num=3,
         checkpoint_at_end=True,
-        checkpoint_score_attr="episode_reward_mean",
+        stop={"training_iteration": 100},
         config={
             "env": env_name,
             "env_config": env_config,
             "framework": "torch",
+            "callbacks": FlockingCallbacks,
             "model": {
                 "custom_model": model_name,
                 "custom_model_config": custom_model_config,
+                "custom_action_dist": "beta_dist",
             },
+            # --- Resources (per trial) ---
             "num_gpus": 0.5,
-            "num_workers": 16,
-            "num_envs_per_worker": 1,
-            "rollout_fragment_length": 1024,
-            "train_batch_size": 16384,
+            "num_workers": 4,
+            "num_envs_per_worker": 4,
+            # --- Rollout / batch ---
+            "rollout_fragment_length": 1000,
+            "train_batch_size": 16000,
             "sgd_minibatch_size": 256,
-            "num_sgd_iter": 32,
-            "lr": 2e-5,
-            "lr_schedule": [[0, 2e-5],
-                            [1e7, 1e-7],],
+            "num_sgd_iter": 10,
+            # --- Learning rate ---
+            "lr": 5e-4,
+            "lr_schedule": [[0, 5e-4], [800000, 1e-4]],
+            # --- PPO ---
             "vf_loss_coeff": 0.5,
             "use_critic": True,
             "use_gae": True,
             "gamma": 0.99,
             "lambda": 0.95,
             "kl_coeff": 0,
-            "clip_param": 0.2,
+            "clip_param": 0.15,
             "vf_clip_param": 256,
-            "grad_clip": 0.5,
+            "grad_clip": 5.0,
             "kl_target": 0.01,
+            "entropy_coeff": 0.0,
+            "normalize_actions": False,
+            # --- Evaluation (disabled) ---
+            "evaluation_interval": None,
         },
     )
