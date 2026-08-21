@@ -10,19 +10,13 @@ from ray.rllib.utils.typing import (
     MultiAgentDict,
 )
 from ray.tune.logger import pretty_print
+from dynamic_k_nn.identifiers import ACTION_TYPE
 from utils.utils import (wrap_to_pi, wrap_to_rectangle,
                               get_rel_pos_dist_in_periodic_boundary, map_periodic_to_continuous_space)
 from typing import List, Optional
 # from pydantic import BaseModel, field_validator, model_validator, ConfigDict, conlist, conint, confloat  # v2
 from pydantic import BaseModel, Field, conlist, conint, validator, root_validator  # v1
 import yaml
-
-
-# Kept as a compatibility alias for the fixed-size training profile.  The
-# environment itself no longer uses this value: distance-pointer action and
-# observation sizes are derived from max(num_agents_pool), which lets the same
-# parameter-only model checkpoint be evaluated at other swarm sizes.
-DISTANCE_POINTER_N_MAX = 20
 
 
 class ControlConfig(BaseModel):
@@ -195,14 +189,14 @@ class NeighborSelectionFlockingEnv(gym.Env):
                 self.action_dtype = np.int8
                 self.action_space = Box(low=0, high=1,
                                         shape=(self.num_agents_max, self.num_agents_max), dtype=self.action_dtype)
-            elif self.config.env.action_type == "distance_pointer":
+            elif self.config.env.action_type == ACTION_TYPE:
                 self.action_dtype = np.int64
                 self.action_space = MultiDiscrete(
                     np.full(self.num_agents_max, self.num_agents_max, dtype=np.int64)
                 )
             else:
                 raise NotImplementedError(
-                    "single_env action_type must be binary_vector or distance_pointer. "
+                    "single_env action_type must be binary_vector or dynamic_k_nn. "
                     "The radius and continuous_vector are still in alpha, sorry."
                 )
         elif self.config.env.env_mode == "multi_env":
@@ -295,11 +289,11 @@ class NeighborSelectionFlockingEnv(gym.Env):
         self.num_agents_min = self.num_agents_pool_np.min()
         self.num_agents_max = self.num_agents_pool_np.max()
 
-        if self.config.env.action_type == "distance_pointer":
+        if self.config.env.action_type == ACTION_TYPE:
             if self.config.env.env_mode != "single_env":
-                raise ValueError("distance_pointer is supported only in single_env mode")
+                raise ValueError("dynamic_k_nn is supported only in single_env mode")
             if self.config.env.comm_range is not None:
-                raise ValueError("distance_pointer requires comm_range=None (all-to-all communication)")
+                raise ValueError("dynamic_k_nn requires comm_range=None (all-to-all communication)")
 
         # # max_time_step: must be an int and > 0
         # assert isinstance(self.max_time_steps, int), "max_time_step must be an int"
@@ -375,8 +369,8 @@ class NeighborSelectionFlockingEnv(gym.Env):
         padding_mask = np.zeros(num_agents_max, dtype=np.bool_)  # (num_agents_max, )
         padding_mask[:num_agents] = True
         # # neighbor_masks
-        if self.config.env.action_type == "distance_pointer" and comm_range is not None:
-            raise ValueError("distance_pointer requires comm_range=None (all-to-all communication)")
+        if self.config.env.action_type == ACTION_TYPE and comm_range is not None:
+            raise ValueError("dynamic_k_nn requires comm_range=None (all-to-all communication)")
         self.config.env.comm_range = comm_range
         if self.config.env.comm_range is None:
             neighbor_masks = self._make_all_to_all_neighbor_masks(padding_mask)
@@ -397,9 +391,9 @@ class NeighborSelectionFlockingEnv(gym.Env):
         return obs
 
     def reset(self):
-        if (self.config.env.action_type == "distance_pointer"
+        if (self.config.env.action_type == ACTION_TYPE
                 and self.config.env.comm_range is not None):
-            raise ValueError("distance_pointer requires comm_range=None (all-to-all communication)")
+            raise ValueError("dynamic_k_nn requires comm_range=None (all-to-all communication)")
 
         # Init time steps
         self.time_step = 0
@@ -456,9 +450,9 @@ class NeighborSelectionFlockingEnv(gym.Env):
         :param action: your_model_output; ndarray of shape (num_agents_max, num_agents_max) expected under the default
         :return: obs, reward, done, info
         """
-        if (self.config.env.action_type == "distance_pointer"
+        if (self.config.env.action_type == ACTION_TYPE
                 and self.config.env.comm_range is not None):
-            raise ValueError("distance_pointer requires comm_range=None (all-to-all communication)")
+            raise ValueError("dynamic_k_nn requires comm_range=None (all-to-all communication)")
 
         state = self.state  # state of the class (flock);
         rel_state = self.rel_state  # did NOT consider the communication network, DELIBERATELY
@@ -566,17 +560,17 @@ class NeighborSelectionFlockingEnv(gym.Env):
         :param model_output
         :return: interpreted_action
         """
-        if self.config.env.action_type != "distance_pointer":
+        if self.config.env.action_type != ACTION_TYPE:
             return model_output
 
-        pointer_action = np.asarray(model_output)
-        assert pointer_action.shape == (self.num_agents_max,), \
-            f"distance_pointer action must have shape ({self.num_agents_max},)"
-        assert np.issubdtype(pointer_action.dtype, np.integer), \
-            "distance_pointer action must have an integer dtype"
-        assert np.all((0 <= pointer_action) & (pointer_action < self.num_agents_max)), \
-            f"distance_pointer entries must be in [0, {self.num_agents_max})"
-        return pointer_action.astype(self.action_dtype, copy=False)
+        cutoff_indices = np.asarray(model_output)
+        assert cutoff_indices.shape == (self.num_agents_max,), \
+            f"dynamic_k_nn action must have shape ({self.num_agents_max},)"
+        assert np.issubdtype(cutoff_indices.dtype, np.integer), \
+            "dynamic_k_nn action must have an integer dtype"
+        assert np.all((0 <= cutoff_indices) & (cutoff_indices < self.num_agents_max)), \
+            f"dynamic_k_nn entries must be in [0, {self.num_agents_max})"
+        return cutoff_indices.astype(self.action_dtype, copy=False)
 
     def validate_action(self, action, neighbor_masks, padding_mask):
         """
@@ -603,22 +597,22 @@ class NeighborSelectionFlockingEnv(gym.Env):
                 "action[i, j] == 1 must not found if padding_mask[j] == 0"
             return
 
-        if self.config.env.action_type == "distance_pointer":
-            assert isinstance(action, np.ndarray), "converted distance_pointer action must be a numpy ndarray"
+        if self.config.env.action_type == ACTION_TYPE:
+            assert isinstance(action, np.ndarray), "converted dynamic_k_nn action must be a numpy ndarray"
             assert np.issubdtype(action.dtype, np.integer), \
-                "converted distance_pointer action must have an integer dtype"
+                "converted dynamic_k_nn action must have an integer dtype"
             assert action.shape == (self.num_agents_max, self.num_agents_max), \
-                "converted distance_pointer action must have shape (num_agents_max, num_agents_max)"
+                "converted dynamic_k_nn action must have shape (num_agents_max, num_agents_max)"
 
             active_pairs = padding_mask[:, None] & padding_mask[None, :]
             assert not np.any(action.astype(bool) & ~active_pairs), \
-                "distance_pointer action must exclude padding agents"
+                "dynamic_k_nn action must exclude padding agents"
             assert np.all(np.diag(action)[padding_mask] == 1), \
-                "distance_pointer action must include active self-loops"
+                "dynamic_k_nn action must include active self-loops"
             assert np.all(np.diag(action)[~padding_mask] == 0), \
-                "distance_pointer action must exclude padding self-loops"
+                "dynamic_k_nn action must exclude padding self-loops"
             assert np.all((neighbor_masks | ~action.astype(bool))), \
-                "distance_pointer action must respect the all-to-all active-agent mask"
+                "dynamic_k_nn action must respect the all-to-all active-agent mask"
             return
 
         raise NotImplementedError(f"Unsupported action_type: {self.config.env.action_type}")
@@ -643,8 +637,8 @@ class NeighborSelectionFlockingEnv(gym.Env):
     def to_binary_action(self, action_in_another_type):
         if self.config.env.action_type == "binary_vector":
             return action_in_another_type
-        elif self.config.env.action_type == "distance_pointer":
-            return self.distance_pointer_to_binary_action(action_in_another_type)
+        elif self.config.env.action_type == ACTION_TYPE:
+            return self.cutoff_indices_to_binary_action(action_in_another_type)
         elif self.config.env.action_type == "radius":
             # action_in_another_type: ndarray of shape (num_agents_max, )
             # # action_in_another_type[i] is the radius of the communication range of agent i
@@ -666,8 +660,8 @@ class NeighborSelectionFlockingEnv(gym.Env):
             raise NotImplementedError("continuous_vector action_type is not implemented yet")
         return None
 
-    def distance_pointer_to_binary_action(self, pointer_action):
-        """Convert one categorical distance pointer per ego into a directed ACS mask.
+    def cutoff_indices_to_binary_action(self, cutoff_indices):
+        """Convert cutoff-agent indices into a directed Dynamic-k NN mask.
 
         Selecting ego ``i`` itself gives it no external neighbors. Selecting an
         active agent ``j`` includes every active ``k`` whose distance from ``i``
@@ -676,7 +670,7 @@ class NeighborSelectionFlockingEnv(gym.Env):
         unmasked external caller or an action-space sample, safely falls back to
         the ego/self choice.
         """
-        pointer_action = self.interpret_action(pointer_action)
+        cutoff_indices = self.interpret_action(cutoff_indices)
         padding_mask = self.state["padding_mask"]
         distances = self.rel_state["rel_agent_dists"]
         binary_action = np.zeros(
@@ -685,7 +679,7 @@ class NeighborSelectionFlockingEnv(gym.Env):
 
         active_indices = np.flatnonzero(padding_mask)
         for ego in active_indices:
-            selected = int(pointer_action[ego])
+            selected = int(cutoff_indices[ego])
             if selected == ego or not padding_mask[selected]:
                 binary_action[ego, ego] = 1
                 continue
@@ -699,7 +693,7 @@ class NeighborSelectionFlockingEnv(gym.Env):
 
     def _make_all_to_all_neighbor_masks(self, padding_mask):
         """Return the all-to-all topology appropriate for the configured action."""
-        if self.config.env.action_type == "distance_pointer":
+        if self.config.env.action_type == ACTION_TYPE:
             return padding_mask[:, None] & padding_mask[None, :]
         return np.ones((self.num_agents_max, self.num_agents_max), dtype=np.bool_)
 

@@ -1,4 +1,4 @@
-"""Regression and integration tests for distance-pointer neighbor selection."""
+"""Regression and integration tests for Dynamic-k NN selection."""
 
 import os
 import unittest
@@ -10,6 +10,7 @@ import torch
 from ray.rllib.models import ModelCatalog
 
 from baselines import RandomNeighborSelection
+from dynamic_k_nn.identifiers import ACTION_TYPE
 from envs.env import (
     Config,
     NeighborSelectionFlockingEnv,
@@ -18,15 +19,15 @@ from envs.env import (
 )
 from models.modules.pointer_net import RawAttentionScoreGenerator
 from models.ppo import NeighborSelectionPPORLlib
-from models.ppo_distance import DistancePointerPPORLlib
+from models.ppo_dynamic_k_nn import DynamicKNNPPORLlib
 
 
 TRAINING_SWARM_SIZE = 20
 
 
-def distance_config(**overrides):
+def dynamic_k_nn_config(**overrides):
     config = Config(**load_dict("envs/default_env_config.yaml"))
-    config.env.action_type = "distance_pointer"
+    config.env.action_type = ACTION_TYPE
     config.env.num_agents_pool = [10, 15, 20]
     config.env.comm_range = None
     config.env.observation_type = "ego_centric"
@@ -59,17 +60,17 @@ def model_config():
     }
 
 
-def make_distance_env(seed=0, **overrides):
+def make_dynamic_k_nn_env(seed=0, **overrides):
     return NeighborSelectionFlockingEnv(
-        config_to_env_input(distance_config(**overrides), seed_id=seed)
+        config_to_env_input(dynamic_k_nn_config(**overrides), seed_id=seed)
     )
 
 
-def make_fixed_distance_env(num_agents, seed=0, **overrides):
+def make_fixed_dynamic_k_nn_env(num_agents, seed=0, **overrides):
     overrides = dict(overrides)
     overrides["num_agents_pool"] = [num_agents]
     return NeighborSelectionFlockingEnv(
-        config_to_env_input(distance_config(**overrides), seed_id=seed)
+        config_to_env_input(dynamic_k_nn_config(**overrides), seed_id=seed)
     )
 
 
@@ -99,25 +100,25 @@ def torch_obs(obs):
     return result
 
 
-def make_distance_model(env):
+def make_dynamic_k_nn_model(env):
     distribution_class, num_outputs = ModelCatalog.get_action_dist(
         env.action_space, {}, framework="torch"
     )
-    model = DistancePointerPPORLlib(
+    model = DynamicKNNPPORLlib(
         obs_space=env.observation_space,
         action_space=env.action_space,
         num_outputs=num_outputs,
         model_config={"custom_model_config": model_config()},
-        name="distance_pointer_test_model",
+        name="dynamic_k_nn_test_model",
     )
     model.eval()
     return model, distribution_class, num_outputs
 
 
-class DistancePointerEnvironmentTest(unittest.TestCase):
+class DynamicKNNEnvironmentTest(unittest.TestCase):
     def test_action_and_observation_spaces_are_dynamic_for_supported_sizes(self):
         for num_agents in (10, 20, 40):
-            env = make_fixed_distance_env(num_agents, seed=num_agents)
+            env = make_fixed_dynamic_k_nn_env(num_agents, seed=num_agents)
             self.assertEqual(env.action_space.shape, (num_agents,))
             np.testing.assert_array_equal(
                 env.action_space.nvec,
@@ -129,7 +130,7 @@ class DistancePointerEnvironmentTest(unittest.TestCase):
             )
             observation = env.reset()
             pointer = np.arange(num_agents, dtype=np.int64)
-            binary = env.distance_pointer_to_binary_action(pointer)
+            binary = env.cutoff_indices_to_binary_action(pointer)
             self.assertEqual(binary.shape, (num_agents, num_agents))
             next_observation, reward, _, info = env.step(pointer)
             self.assertEqual(next_observation["padding_mask"].shape, (num_agents,))
@@ -138,7 +139,7 @@ class DistancePointerEnvironmentTest(unittest.TestCase):
             self.assertNotIn("control_inputs", info)
 
     def test_fixed_action_space_uniform_swarm_pool_and_invariants(self):
-        env = make_distance_env(seed=123)
+        env = make_dynamic_k_nn_env(seed=123)
         np.testing.assert_array_equal(
             env.action_space.nvec,
             np.full(TRAINING_SWARM_SIZE, TRAINING_SWARM_SIZE),
@@ -153,7 +154,7 @@ class DistancePointerEnvironmentTest(unittest.TestCase):
         # range sampling without making the test statistically fragile.
         self.assertTrue(all(15 <= count <= 45 for count in counts.values()), counts)
 
-        bad_config = distance_config(comm_range=100.0)
+        bad_config = dynamic_k_nn_config(comm_range=100.0)
         with self.assertRaisesRegex(ValueError, "comm_range=None"):
             NeighborSelectionFlockingEnv(config_to_env_input(bad_config, seed_id=0))
 
@@ -162,17 +163,17 @@ class DistancePointerEnvironmentTest(unittest.TestCase):
             env.reset()
 
     def test_self_external_tie_padding_and_action_history(self):
-        env = make_distance_env(seed=2, get_action_hist=True)
+        env = make_dynamic_k_nn_env(seed=2, get_action_hist=True)
         obs = deterministic_reset(env, 10)
         pointer = np.arange(TRAINING_SWARM_SIZE, dtype=np.int64)
 
-        self_action = env.distance_pointer_to_binary_action(pointer)
+        self_action = env.cutoff_indices_to_binary_action(pointer)
         np.testing.assert_array_equal(
             np.flatnonzero(self_action[0]), np.array([0])
         )
 
         pointer[0] = 1
-        tied_action = env.distance_pointer_to_binary_action(pointer)
+        tied_action = env.cutoff_indices_to_binary_action(pointer)
         np.testing.assert_array_equal(
             np.flatnonzero(tied_action[0]), np.array([0, 1, 2])
         )
@@ -182,13 +183,13 @@ class DistancePointerEnvironmentTest(unittest.TestCase):
         )
 
         pointer[0] = 3
-        farther_action = env.distance_pointer_to_binary_action(pointer)
+        farther_action = env.cutoff_indices_to_binary_action(pointer)
         np.testing.assert_array_equal(
             np.flatnonzero(farther_action[0]), np.array([0, 1, 2, 3])
         )
 
         pointer[0] = 19
-        padding_choice = env.distance_pointer_to_binary_action(pointer)
+        padding_choice = env.cutoff_indices_to_binary_action(pointer)
         np.testing.assert_array_equal(
             np.flatnonzero(padding_choice[0]), np.array([0])
         )
@@ -196,7 +197,7 @@ class DistancePointerEnvironmentTest(unittest.TestCase):
         self.assertFalse(padding_choice[:, 10:].any())
 
         pointer[0] = 1
-        expected = env.distance_pointer_to_binary_action(pointer)
+        expected = env.cutoff_indices_to_binary_action(pointer)
         next_obs, reward, done, info = env.step(pointer)
         np.testing.assert_array_equal(env.action_hist[0], expected.astype(bool))
         self.assertTrue(np.isfinite(reward))
@@ -208,15 +209,15 @@ class DistancePointerEnvironmentTest(unittest.TestCase):
         np.testing.assert_array_equal(obs["neighbor_masks"], active_pairs)
 
 
-class DistancePointerModelTest(unittest.TestCase):
+class DynamicKNNModelTest(unittest.TestCase):
     def test_n20_state_dict_strict_loads_and_steps_at_10_20_40(self):
-        source_env = make_fixed_distance_env(20, seed=20)
-        source_model, _, _ = make_distance_model(source_env)
+        source_env = make_fixed_dynamic_k_nn_env(20, seed=20)
+        source_model, _, _ = make_dynamic_k_nn_model(source_env)
         source_state = source_model.state_dict()
 
         for num_agents in (10, 20, 40):
-            env = make_fixed_distance_env(num_agents, seed=num_agents)
-            model, _, num_outputs = make_distance_model(env)
+            env = make_fixed_dynamic_k_nn_env(num_agents, seed=num_agents)
+            model, _, num_outputs = make_dynamic_k_nn_model(env)
             model.load_state_dict(source_state, strict=True)
             observation = env.reset()
             with torch.no_grad():
@@ -227,8 +228,8 @@ class DistancePointerModelTest(unittest.TestCase):
             env.step(pointer.cpu().numpy().astype(np.int64))
 
     def test_candidate_masks_distribution_and_dynamic_actor(self):
-        env = make_distance_env(seed=3)
-        model, distribution_class, num_outputs = make_distance_model(env)
+        env = make_dynamic_k_nn_env(seed=3)
+        model, distribution_class, num_outputs = make_dynamic_k_nn_model(env)
         self.assertEqual(num_outputs, TRAINING_SWARM_SIZE ** 2)
         self.assertIsInstance(model.actor.generator, RawAttentionScoreGenerator)
 
@@ -269,14 +270,14 @@ class DistancePointerModelTest(unittest.TestCase):
             self.assertEqual(tuple(compact_context.shape), (1, 1, 16))
 
     def test_padding_is_excluded_from_observation_context_and_critic(self):
-        env = make_distance_env(seed=4)
+        env = make_dynamic_k_nn_env(seed=4)
         obs = deterministic_reset(env, 10)
         self.assertFalse(obs["local_agent_infos"][10:, :, :].any())
         self.assertFalse(obs["local_agent_infos"][:, 10:, :].any())
         self.assertFalse(obs["neighbor_masks"][10:, :].any())
         self.assertFalse(obs["neighbor_masks"][:, 10:].any())
 
-        model, _, _ = make_distance_model(env)
+        model, _, _ = make_dynamic_k_nn_model(env)
         original = torch_obs(obs)
         perturbed = {key: value.clone() for key, value in original.items()}
         perturbed["local_agent_infos"][:, 10:, :, :] = 12345.0
@@ -319,20 +320,20 @@ class LegacyBinaryRegressionTest(unittest.TestCase):
         self.assertEqual(tuple(logits.shape), (1, 2 * 5 * 5))
 
 
-class DistancePointerPPORolloutTest(unittest.TestCase):
+class DynamicKNNPPORolloutTest(unittest.TestCase):
     def test_short_ppo_rollout(self):
         import ray
         from ray.rllib.algorithms.ppo import PPO
         from ray.tune.registry import register_env
 
         suffix = str(os.getpid())
-        env_name = "distance_pointer_rollout_" + suffix
-        model_name = "distance_pointer_rollout_model_" + suffix
+        env_name = "dynamic_k_nn_rollout_" + suffix
+        model_name = "dynamic_k_nn_rollout_model_" + suffix
         env_config = config_to_env_input(
-            distance_config(is_training=True), seed_id=7
+            dynamic_k_nn_config(is_training=True), seed_id=7
         )
         register_env(env_name, lambda cfg: NeighborSelectionFlockingEnv(cfg))
-        ModelCatalog.register_custom_model(model_name, DistancePointerPPORLlib)
+        ModelCatalog.register_custom_model(model_name, DynamicKNNPPORLlib)
 
         if ray.is_initialized():
             ray.shutdown()
@@ -365,7 +366,7 @@ class DistancePointerPPORolloutTest(unittest.TestCase):
             result = algorithm.train()
             self.assertGreaterEqual(result["timesteps_total"], 8)
 
-            env = make_distance_env(seed=8)
+            env = make_dynamic_k_nn_env(seed=8)
             obs = env.reset()
             action = algorithm.compute_single_action(obs)
             self.assertEqual(action.shape, (20,))

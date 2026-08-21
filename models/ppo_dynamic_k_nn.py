@@ -1,4 +1,4 @@
-"""RLlib PPO model for categorical distance-pointer neighbor selection."""
+"""RLlib PPO model for pointer-parameterized Dynamic-k NN selection."""
 
 from typing import Dict, List
 
@@ -11,7 +11,7 @@ from ray.rllib.utils.typing import TensorType
 from models.ppo import NeighborSelectionPPORLlib
 
 
-class DistancePointerPPORLlib(NeighborSelectionPPORLlib):
+class DynamicKNNPPORLlib(NeighborSelectionPPORLlib):
     """Shared Transformer/pointer policy with one categorical choice per ego.
 
     The inherited actor applies the same encoder, decoder, and
@@ -29,12 +29,12 @@ class DistancePointerPPORLlib(NeighborSelectionPPORLlib):
 
     def __init__(self, obs_space, action_space, num_outputs, model_config, name, **kwargs):
         if not hasattr(action_space, "nvec"):
-            raise TypeError("DistancePointerPPORLlib requires a MultiDiscrete action space")
+            raise TypeError("DynamicKNNPPORLlib requires a MultiDiscrete action space")
 
         nvec = np.asarray(action_space.nvec)
         action_size = action_space.shape[0]
         if nvec.shape != (action_size,) or not np.all(nvec == action_size):
-            raise ValueError("distance-pointer action space must be MultiDiscrete([N] * N)")
+            raise ValueError("Dynamic-k NN action space must be MultiDiscrete([N] * N)")
 
         super().__init__(
             obs_space=obs_space,
@@ -74,7 +74,7 @@ class DistancePointerPPORLlib(NeighborSelectionPPORLlib):
         """Return flattened categorical pointer logits with padding masked."""
         batch_size, num_egos, num_candidates = attention_scores.shape
         if num_egos != num_candidates:
-            raise ValueError("distance pointer requires one candidate per ego index")
+            raise ValueError("Dynamic-k NN action requires one candidate per ego index")
 
         active_agents = padding_mask.bool()
         # RawAttentionScoreGenerator already produces scaled dot-product

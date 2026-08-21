@@ -9,9 +9,16 @@ from ray.air.callbacks.wandb import WandbLoggerCallback
 from ray.rllib.models import ModelCatalog
 from ray.tune.registry import register_env
 
+from dynamic_k_nn.identifiers import (
+    ACTION_ENCODING,
+    ACTION_TYPE,
+    EXPERIMENT_NAME,
+    MODEL_ID,
+    WANDB_PROJECT as DEFAULT_WANDB_PROJECT,
+)
 from envs.env import NeighborSelectionFlockingEnv, Config, load_config
 from models.ppo import NeighborSelectionPPORLlib
-from models.ppo_distance import DistancePointerPPORLlib
+from models.ppo_dynamic_k_nn import DynamicKNNPPORLlib
 
 
 def _env_int(name, default, minimum=1):
@@ -61,11 +68,11 @@ CHECKPOINT_FREQ = _env_int("CHECKPOINT_FREQ", 8)
 KEEP_CHECKPOINTS_NUM = _env_int("KEEP_CHECKPOINTS_NUM", 5)
 WANDB_ENABLED = _env_bool("WANDB_ENABLED", True)
 WANDB_PROJECT = os.environ.get(
-    "WANDB_PROJECT", "nb-selection-distance-pointer"
+    "WANDB_PROJECT", DEFAULT_WANDB_PROJECT
 )
 WANDB_RUN_NAME = os.environ.get(
     "WANDB_RUN_NAME",
-    "ppo-distance-pointer-n{}-seed{}-{}m-mb{}-e{}".format(
+    "ppo-dynamic-k-nn-n{}-seed{}-{}m-mb{}-e{}".format(
         TRAINING_SWARM_SIZE,
         BASE_ENV_SEED,
         TOTAL_TRAINING_TIMESTEPS // 1_000_000,
@@ -79,6 +86,7 @@ WANDB_API_KEY_FILE = Path(
 TRAINING_RESULTS_DIR = os.environ.get(
     "TRAINING_RESULTS_DIR", "/workspace/test_results"
 )
+TUNE_EXPERIMENT_NAME = os.environ.get("TUNE_EXPERIMENT_NAME", EXPERIMENT_NAME)
 
 if TRAIN_BATCH_SIZE % SGD_MINIBATCH_SIZE != 0:
     raise ValueError(
@@ -111,7 +119,7 @@ if __name__ == "__main__":
     # isolated while preserving the official callback's queue protocol.
     mp.set_start_method("spawn", force=True)
 
-    workflow_run_id = os.environ.get("WORKFLOW_RUN_ID", "manual-distance-pointer")
+    workflow_run_id = os.environ.get("WORKFLOW_RUN_ID", "manual-dynamic-k-nn")
     if WANDB_ENABLED and (
         not WANDB_API_KEY_FILE.is_file() or WANDB_API_KEY_FILE.stat().st_size == 0
     ):
@@ -135,7 +143,7 @@ if __name__ == "__main__":
     my_config.env.acs_train_w_ctrl = 0.02
     my_config.env.acs_train_w_pos  = 1.0
     my_config.env.acs_train_w_vel  = 0.2
-    my_config.env.action_type = "distance_pointer"
+    my_config.env.action_type = ACTION_TYPE
     my_config.env.agent_name_prefix = "agent_"
     my_config.env.alignment_goal = 0.97
     my_config.env.alignment_rate_goal = 0.03
@@ -202,15 +210,17 @@ if __name__ == "__main__":
         "use_residual_in_decoder": True,
     }
 
-    # Keep the legacy registration name available for binary checkpoints and
-    # use a distinct name for new distance-pointer runs.
+    # The binary model remains available for legacy binary-vector experiments.
     ModelCatalog.register_custom_model("neighbor_selector_rl", NeighborSelectionPPORLlib)
-    model_name = "distance_pointer_neighbor_selector_rl"
-    ModelCatalog.register_custom_model(model_name, DistancePointerPPORLlib)
+    model_name = MODEL_ID
+    ModelCatalog.register_custom_model(model_name, DynamicKNNPPORLlib)
 
     resolved_training_config = {
         "base_env_seed": BASE_ENV_SEED,
         "training_swarm_size": TRAINING_SWARM_SIZE,
+        "action_type": ACTION_TYPE,
+        "action_encoding": ACTION_ENCODING,
+        "tune_experiment_name": TUNE_EXPERIMENT_NAME,
         "num_rollout_workers": NUM_ROLLOUT_WORKERS,
         "num_envs_per_worker": NUM_ENVS_PER_WORKER,
         "rollout_fragment_length": ROLLOUT_FRAGMENT_LENGTH,
@@ -251,7 +261,7 @@ if __name__ == "__main__":
                 save_checkpoints=False,
                 name=WANDB_RUN_NAME,
                 tags=[
-                    "distance-pointer",
+                    "dynamic-k-nn",
                     "ppo",
                     "n{}".format(TRAINING_SWARM_SIZE),
                     "seed{}".format(BASE_ENV_SEED),
@@ -267,7 +277,7 @@ if __name__ == "__main__":
     # train
     tune.run(
         "PPO",
-        name="distance_pointer_neighbor_selection",
+        name=TUNE_EXPERIMENT_NAME,
         local_dir=TRAINING_RESULTS_DIR,
         # AUTO+ERRORED restores the same Tune trial/checkpoint after either a
         # process/container failure or a host reboot. time_total_s is carried

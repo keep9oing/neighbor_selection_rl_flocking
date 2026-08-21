@@ -23,7 +23,7 @@ from models.modules.pointer_net import RawAttentionScoreGenerator, RawAttentionS
 
 
 class NeighborSelectionPPORLlib(TorchModelV2, nn.Module):
-    # The distance-pointer subclass opts into padding-aware encoder masks while
+    # The Dynamic-k NN subclass opts into padding-aware encoder masks while
     # the legacy binary model retains its original behavior and state dict.
     respect_padding_mask = False
 

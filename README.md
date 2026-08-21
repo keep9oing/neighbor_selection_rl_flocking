@@ -1,11 +1,10 @@
-# Dynamic-k Neighbor Selection with PPO
+# Dynamic-k Nearest-Neighbor Selection with PPO
 
-This branch trains a distance-pointer policy for ACS flocking. For every ego
-agent, the policy selects one active agent as a distance pointer. All active
-agents no farther away than that pointer become directed neighbors, so the
-number of selected neighbors `k` changes with the observation and the policy
-output. Selecting the ego itself means zero external neighbors; equal-distance
-ties are included.
+This branch trains a Dynamic-k nearest-neighbor policy for ACS flocking. For
+every ego agent, the policy points to one active cutoff agent. The cutoff agent
+and all active agents no farther away become directed neighbors, so the number
+of external neighbors `k` changes with the observation and policy output.
+Selecting the ego itself means `k=0`; equal-distance ties are included.
 
 The policy uses rotated ego-centric observations and a shared
 Transformer/pointer network. Training is fixed to 20 agents by default, while
@@ -51,7 +50,7 @@ ${EDITOR:-vi} ~/.config/wandb/api_key
 chmod 600 ~/.config/wandb/api_key
 ```
 
-The default project is `nb-selection-distance-pointer`. Override it with
+The default project is `nb-selection-dynamic-k-nn`. Override it with
 `WANDB_PROJECT`, or set `WANDB_ENABLED=false` to train without W&B.
 
 ## Durable background training
@@ -110,5 +109,5 @@ docker run --rm --init --shm-size 4g \
   --env START_SSHD=0 \
   --mount type=bind,src="$(pwd)",dst=/workspace/source,readonly \
   uom-neighbor-selection \
-  python -m unittest -v test_distance_pointer
+  python -m unittest -v test_dynamic_k_nn
 ```
