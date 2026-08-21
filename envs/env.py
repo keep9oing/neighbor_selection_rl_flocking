@@ -18,6 +18,13 @@ from pydantic import BaseModel, Field, conlist, conint, validator, root_validato
 import yaml
 
 
+# Kept as a compatibility alias for the fixed-size training profile.  The
+# environment itself no longer uses this value: distance-pointer action and
+# observation sizes are derived from max(num_agents_pool), which lets the same
+# parameter-only model checkpoint be evaluated at other swarm sizes.
+DISTANCE_POINTER_N_MAX = 20
+
+
 class ControlConfig(BaseModel):
     speed: float = 15.0  # Speed in m/s.
     max_turn_rate: float = 8/15  # Maximum turn rate in rad/s.
@@ -75,6 +82,10 @@ class EnvConfig(BaseModel):
     # ACS neighbor selection option: if True, neighbor selection (action) applies only to heading (alignment) control,
     # while cohesion/separation uses the original (full) neighbor network
     apply_to_heading_only: bool = False
+    # Evaluation-only diagnostics.  Copying the converted action and controls
+    # into ``info`` is intentionally opt-in so rollout workers do not pay the
+    # allocation cost during training.
+    evaluation_diagnostics: bool = False
 
 
 class Config(BaseModel):
@@ -487,6 +498,9 @@ class NeighborSelectionFlockingEnv(gym.Env):
             "original_reward": _reward,
             "comm_loss_agents": comm_loss_agents,
         }
+        if self.config.env.evaluation_diagnostics:
+            info["binary_action"] = joint_action.copy()
+            info["control_inputs"] = control_inputs.copy()
         info = self.get_extra_info(info, next_state, next_rel_state, control_inputs, rewards, done)
         if self.config.env.get_state_hist:
             self.agent_states_hist[self.time_step] = next_state["agent_states"]
