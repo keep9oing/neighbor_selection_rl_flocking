@@ -92,3 +92,12 @@ Append-only, newest at bottom. 벽시계 주장은 종료 시 아티팩트 mtime
 - 메모리 project_success_criterion.md rung 7 갱신 + MEMORY.md 훅 갱신.
 - 미커밋 상태로 대기: 커밋은 사용자 명시 승인 시 docs+src만(.gitignore가
   data/·logs/ 제외), push 금지.
+
+## 2026-08-14 — 커밋 (사후 기록)
+
+- 사용자 승인으로 a93a2a4 커밋 (exp/autonomous-research 브랜치, docs 5 +
+  src 8 = 13파일). data/·logs/는 관례대로 미커밋. push 없음. 이후
+  main으로 merge됨 (324c0bf).
+- (2026-08-21 레포 정리) 세션 노트 HANDOFF_NOTES.md의 유일한 미흡수 항목이
+  본 항목으로 흡수됨 → 관례(세션 산출물 비커밋·완료 후 흡수·삭제)에 따라
+  HANDOFF_NOTES.md 삭제.

@@ -1,6 +1,11 @@
 # Heuristic Baseline Neighbor Selection Strategies
 
-This directory contains implementations of heuristic baseline neighbor selection strategies for the flocking environment.
+> **Note (2026-08):** this catalog covers the original 8 baselines. Four newer ones —
+> `ActiveSearch`, `GazingPreference`, `MotionSalienceThreshold`, `VisualAttention` —
+> are implemented in `baselines.py` (registered in the `create_baseline` factory) but
+> not yet documented here; see their class docstrings.
+
+This document describes the heuristic baseline neighbor selection strategies implemented in `baselines.py` (repo root) for the flocking environment.
 
 ## Overview
 

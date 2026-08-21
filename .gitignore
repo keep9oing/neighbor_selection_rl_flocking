@@ -50,9 +50,15 @@ htmlcov/
 *.tmp
 .cache/
 
+# Run artifacts (regenerable / heavy)
 ray_results/
 test_results/
+evaluate_results/
 
-# Claude Code
+# Canonical checkpoint copies — binaries untracked for now (see checkpoints/PROVENANCE.md)
+checkpoints/*
+!checkpoints/PROVENANCE.md
+
+# Local-only docs (untracked by choice)
 CLAUDE.md
-HANDOFF.md
+REPORT_hardtopk_distaux_KO.md

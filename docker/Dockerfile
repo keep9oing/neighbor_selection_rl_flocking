@@ -52,10 +52,11 @@ RUN python -m pip install --no-cache-dir --extra-index-url https://download.pyto
     torch==1.12.1+cu113 torchvision==0.13.1+cu113 torchaudio==0.12.1+cu113
 
 # get the apples
+# NOTE: this list mirrors /workspace/requirements.txt minus the three torch pins
+# (installed above from the cu113 index). Keep the two in sync when bumping pins.
 RUN cat > /tmp/requirements.txt <<'REQ'
 absl-py==2.1.0
 aiosignal==1.3.1
-annotated-types==0.7.0
 attrs==23.2.0
 certifi==2024.2.2
 charset-normalizer==3.3.2
@@ -94,7 +95,6 @@ pipdeptree==2.22.0
 platformdirs==4.2.2
 protobuf==4.25.3
 pydantic==1.10.13
-pydantic_core==2.18.4
 pyparsing==3.1.2
 python-dateutil==2.9.0.post0
 pytz==2024.1

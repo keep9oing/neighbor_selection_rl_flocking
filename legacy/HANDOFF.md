@@ -1,5 +1,7 @@
 # Handoff: Ego-Centric Neighbor Selection for ACS Flocking
 
+> **[ARCHIVED 2026-08-21]** Frozen research log covering Phases 1–14 (Jan–May 2026), written before the `studies/` line existed. No longer a valid handoff — the current line and its results live in `studies/` (latest: `studies/acs-confirm/REPORT_KO.md`). Kept because it is the only record of the Phase 1–13 trajectory and the ruled-out-approaches list. The scripts it references now live in `legacy/`.
+
 ## Research Goal
 
 Train an ego-centric RL policy that, given each agent's local observation, selects **which neighbors to listen to** (binary adjacency matrix per step). The low-level ACS controller then uses the selected subgraph to compute velocity updates.
